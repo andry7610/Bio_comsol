@@ -128,3 +128,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+# Запуск тестов (из корня репозитория):
+#   python tests/test_bio_diffusion_implicit.py
