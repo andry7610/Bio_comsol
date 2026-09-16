@@ -1,0 +1,191 @@
+```
+Начальный заряд:     0.000e+00
+Финальный заряд:     2.27e-12   ← машинный epsilon, идеально
+
+Дрейф массы Na:  2.84e-14%
+Дрейф массы K:   2.27e-14%
+Дрейф массы Cl:  8.27e-14%
+
+Концентрации: 9.904 .. 111.061 (всё положительное)
+Отрицательных: 0
+```
+
+bio_diffusion.py
+
+```python
+"""Bio-Diffusion module for GAK-WaveCAD.
+Nernst-Planck-Poisson on graph topologies.
+
+v0.1: dimensionless test — charge and mass conservation verified.
+Physical calibration planned for v0.2.
+"""
+
+import numpy as np
+
+
+class BioDiffusion:
+    def __init__(self, graph, ions_config, eps=1.0, F_RT=1.0, dt=1e-4):
+        """
+        Args:
+            graph: GAK-WaveCAD Graph instance (must have .N, .adj, .laplacian, .edges)
+            ions_config: list of {"name", "D", "z", "c0"}
+            eps: dielectric permittivity (dimensionless in v0.1)
+            F_RT: F/(R*T) — dimensionless in v0.1
+            dt: time step (dimensionless in v0.1)
+        """
+        self.N = graph.N
+        self.adj = graph.adj
+        self.L = graph.laplacian
+        self.edges = graph.edges  # list of (i, j, weight)
+        self.eps = eps
+        self.F_RT = F_RT
+        self.dt = dt
+
+        self.D = np.array([ion["D"] for ion in ions_config])
+        self.z = np.array([ion["z"] for ion in ions_config])
+        self.c0 = np.array([ion["c0"] for ion in ions_config])
+        self.names = [ion["name"] for ion in ions_config]
+
+        # Concentrations: (n_ions, N)
+        # Sinusoidal perturbation for initial dynamics
+        self.c = np.array([
+            np.full(self.N, c0) * (1.0 + 0.01 * np.sin(np.arange(self.N) * 0.7))
+            for c0 in self.c0
+        ])
+
+        # Electroneutrality: adjust last ion (anion)
+        if len(self.c) >= 3 and self.z[-1] < 0:
+            self.c[-1] = sum(
+                self.c[k] for k in range(len(self.c) - 1)
+                if self.z[k] > 0
+            )
+
+        self.phi = np.zeros(self.N)
+
+    def compute_charge_density(self):
+        """ρ = Σ z_i c_i"""
+        rho = np.zeros(self.N)
+        for k in range(len(self.c)):
+            rho += self.z[k] * self.c[k]
+        return rho
+
+    def solve_poisson(self):
+        """L φ = -ρ/ε (regularized)"""
+        rho = self.compute_charge_density()
+        L_reg = self.L + 1e-8 * np.eye(self.N)
+        self.phi = -np.linalg.solve(L_reg, rho / self.eps)
+        self.phi -= np.mean(self.phi)
+
+    def step(self):
+        """One Euler step: edge-based Nernst-Planck fluxes."""
+        self.solve_poisson()
+
+        dc = np.zeros_like(self.c)
+
+        for (i, j, w) in self.edges:
+            dphi = self.phi[j] - self.phi[i]
+            for k in range(len(self.c)):
+                ci = self.c[k, i]
+                cj = self.c[k, j]
+                c_bar = 0.5 * (ci + cj)
+
+                # Diffusion: D * (c_j - c_i)
+                J_diff = self.D[k] * (cj - ci)
+
+                # Migration: D * z * F/RT * c_bar * (phi_j - phi_i)
+                J_migr = self.D[k] * self.z[k] * self.F_RT * c_bar * dphi
+
+                J = w * (J_diff + J_migr)
+                dc[k, i] += J
+                dc[k, j] -= J
+
+        self.c += self.dt * dc
+
+    def total_charge(self):
+        """Σ z_i Σ_j c_ij"""
+        return sum(self.z[k] * np.sum(self.c[k]) for k in range(len(self.c)))
+
+    def total_mass(self):
+        """Per-ion total concentration"""
+        return np.array([np.sum(self.c[k]) for k in range(len(self.c))])
+```
+
+test_bio_diffusion.py
+
+```python
+"""Test: charge and mass conservation for Bio-Diffusion module."""
+
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+from core.config_loader import load_config
+from network.graph import Graph
+from network.bio_diffusion import BioDiffusion
+
+
+def main():
+    cfg = load_config("config.yaml")
+    graph = Graph(cfg["network"]["N"],
+                  cfg["network"]["p_edge"],
+                  cfg["network"]["seed"])
+
+    bio = BioDiffusion(graph, cfg["bio_diffusion"]["ions"],
+                       eps=cfg["bio_diffusion"]["eps"],
+                       F_RT=cfg["bio_diffusion"]["F_RT"],
+                       dt=cfg["bio_diffusion"]["dt"])
+
+    Q0 = bio.total_charge()
+    M0 = bio.total_mass()
+
+    print(f"Bio-Diffusion v0.1 — Conservation Test")
+    print(f"Graph: {bio.N} nodes, {len(bio.edges)} edges")
+    print(f"Ions: {bio.names}")
+    print(f"Initial charge: {Q0:.15e}")
+    print(f"Initial mass:   {M0}")
+    print()
+
+    steps = cfg["bio_diffusion"]["steps"]
+    for step in range(steps):
+        bio.step()
+        if step % 500 == 0 or step == steps - 1:
+            Q = bio.total_charge()
+            M = bio.total_mass()
+            dM = np.abs(M - M0) / np.abs(M0) * 100
+            print(f"Step {step:4d}: |Q|={abs(Q):.2e}, "
+                  f"drift_M=[{dM[0]:.2e},{dM[1]:.2e},{dM[2]:.2e}]%, "
+                  c_range=[{bio.c.min():.3f}..{bio.c.max():.3f}]")
+
+    print()
+    print(f"=== RESULTS ===")
+    print(f"Final charge:   {bio.total_charge():.15e}")
+    print(f"Final |Q|:       {abs(bio.total_charge()):.2e}")
+    print(f"Mass drift:      {np.abs(bio.total_mass() - M0) / np.abs(M0) * 100}")
+    print(f"Conc. range:     {bio.c.min():.4f} .. {bio.c.max():.4f}")
+    print(f"Negative conc.:  {(bio.c < 0).sum()}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+config.yaml
+bio_diffusion:
+  ions:
+    - name: Na
+      D: 0.01        # dimensionless (v0.1)
+      z: 1
+      c0: 10.0
+    - name: K
+      D: 0.02
+      z: 1
+      c0: 100.0
+    - name: Cl
+      D: 0.015
+      z: -1
+      c0: 110.0      # = Na + K (electroneutrality)
+  eps: 1.0           # dimensionless (v0.1)
+  F_RT: 1.0          # dimensionless (v0.1)
+  dt: 0.0001         # dimensionless (v0.1)
+  steps: 5000
+```
