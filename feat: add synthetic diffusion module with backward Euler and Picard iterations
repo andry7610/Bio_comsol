@@ -1,0 +1,180 @@
+synthetic/diffusion.py — финальный v0.3
+python
+"""
+Bio-Diffusion — синтетический модуль (v0.3).
+
+Пореберная неявная схема backward Euler + итерации Пикара.
+Безразмерные переменные, eps* = 1.0 (макроскопическая модель).
+Устойчива при F_RT = 1.0, dt до 1e-2.
+
+История:
+  v0.1 — явный Эйлер, пореберные потоки, сохранение заряда
+  v0.2 — неявный backward Euler, F_RT = 1.0 без NaN
+  v0.3 — итерации Пикара, eps < 1.0
+"""
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+
+
+class SyntheticBioDiffusion:
+    """Ионный транспорт на графе: Нернст-Планк-Пуассон.
+
+    Безразмерные единицы:
+      c*  = c / c_ref
+      φ*  = φ · F / (RT)
+      F_RT* = 1.0
+      eps*  — эффективная связь
+
+    При eps* = 1.0 дебаевская длина ~ шагу сетки.
+    """
+
+    def __init__(self, graph, ions_config, eps=1.0, F_RT=1.0, dt=1e-3,
+                 picard_tol=1e-6, picard_max_iter=20):
+        self.N = graph.N
+        self.edges = graph.edges
+        self.L = sp.csr_matrix(graph.laplacian)
+        self.eps = eps
+        self.F_RT = F_RT
+        self.dt = dt
+        self.picard_tol = picard_tol
+        self.picard_max_iter = picard_max_iter
+
+        self.D = np.array([ion["D"] for ion in ions_config])
+        self.z = np.array([ion["z"] for ion in ions_config])
+        self.c0 = np.array([ion["c0"] for ion in ions_config])
+        self.names = [ion["name"] for ion in ions_config]
+
+        # Фон
+        self.c = np.full((len(self.c0), self.N), 2.0)
+
+        # Электронейтральность
+        if len(self.c) >= 3 and self.z[-1] < 0:
+            self.c[-1] = sum(
+                self.c[k] for k in range(len(self.c) - 1)
+                if self.z[k] > 0
+            )
+
+        # Дирихле (ванна)
+        self.dirichlet_nodes = [0, 1, 2]
+        for k in range(len(self.c0)):
+            self.c[k, self.dirichlet_nodes] = self.c0[k]
+
+        # Заготовка под мембрану (шаг 2.5)
+        self.membrane_edges = []
+
+        self.phi = np.zeros(self.N)
+
+    def compute_charge_density(self):
+        rho = np.zeros(self.N)
+        for k in range(len(self.c)):
+            rho += self.z[k] * self.c[k]
+        return rho
+
+    def solve_poisson(self):
+        rho = self.compute_charge_density()
+        L_reg = self.L + 1e-8 * sp.eye(self.N, format='csr')
+        self.phi = -spla.spsolve(L_reg, rho / self.eps)
+        self.phi -= np.mean(self.phi)
+
+    def build_system_matrix(self, k):
+        """Пореберная неявная матрица для иона k."""
+        N = self.N
+        D = self.D[k]
+        z = self.z[k]
+        F_RT = self.F_RT
+        dt = self.dt
+
+        A = sp.lil_matrix((N, N))
+
+        for (i, j, w) in self.edges:
+            dphi = self.phi[j] - self.phi[i]
+
+            # Диффузия: D*w*(c_j - c_i)
+            A[i, i] -= dt * D * w
+            A[i, j] += dt * D * w
+            A[j, j] -= dt * D * w
+            A[j, i] += dt * D * w
+
+            # Миграция: D*z*F_RT*0.5*(c_i+c_j)*dphi
+            coef = dt * D * z * F_RT * 0.5 * dphi
+            A[i, i] -= coef
+            A[i, j] -= coef
+            A[j, i] += coef
+            A[j, j] += coef
+
+        I = sp.eye(N, format='lil')
+        return (I - A).tocsr()
+
+    def apply_dirichlet(self, A, b, k):
+        for node in self.dirichlet_nodes:
+            A[node, :] = 0.0
+            A[node, node] = 1.0
+            b[node] = self.c0[k]
+        return A, b
+
+    def step(self):
+        """Неявный шаг backward Euler + итерации Пикара."""
+        phi_diff = 0.0
+        for iteration in range(self.picard_max_iter):
+            self.solve_poisson()
+            phi_old = self.phi.copy()
+
+            for k in range(len(self.c)):
+                A = self.build_system_matrix(k)
+                b = self.c[k].copy()
+                A, b = self.apply_dirichlet(A, b, k)
+                self.c[k] = spla.spsolve(A, b)
+
+            phi_diff = np.max(np.abs(self.phi - phi_old))
+            if phi_diff < self.picard_tol:
+                break
+
+        if phi_diff >= self.picard_tol:
+            print(f"⚠ Пикар не сошёлся (delta = {phi_diff:.2e})")
+
+    def total_charge(self):
+        return sum(self.z[k] * np.sum(self.c[k]) for k in range(len(self.c)))
+
+    def total_mass(self):
+        return np.array([np.sum(self.c[k]) for k in range(len(self.c))])
+biological/diffusion.py — каркас v0.4
+python
+"""
+Bio-Diffusion — биологический модуль (v0.4 — каркас).
+
+Квазинейтральное приближение для масштабов >> дебаевской длины.
+Метод Ньютона для жёсткой связи (eps << 1.0).
+
+Статус: заглушка. Реализация после обкатки synthetic v0.3.
+"""
+
+import numpy as np
+
+
+class BiologicalBioDiffusion:
+    """Квазинейтральный ионный транспорт в живой ткани.
+
+    Вместо Пуассона: ρ ≈ 0 → потенциал из условия электронейтральности.
+    Метод Ньютона для нелинейной системы вместо Пикара.
+    """
+
+    def __init__(self, graph, ions_config, physical, dt=1e-6):
+        self.N = graph.N
+        self.edges = graph.edges
+        self.dt = dt
+        self.D = np.array([ion["D"] for ion in ions_config])
+        self.z = np.array([ion["z"] for ion in ions_config])
+        self.c0 = np.array([ion["c0"] for ion in ions_config])
+        self.names = [ion["name"] for ion in ions_config]
+        self.phi = np.zeros(self.N)
+        self.c = np.full((len(self.c0), self.N), 2.0)
+        # TODO: квазинейтральность, Ньютон, физические единицы
+        raise NotImplementedError("v0.4 — каркас. Используйте SyntheticBioDiffusion.")
+
+    def step(self):
+        raise NotImplementedError
+
+    def total_charge(self):
+        return sum(self.z[k] * np.sum(self.c[k]) for k in range(len(self.c)))
