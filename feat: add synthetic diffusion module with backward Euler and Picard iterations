@@ -1,3 +1,6 @@
+# Запуск тестов (из корня репозитория)
+python tests/test_energy_with_collapse.py
+python tests/test_bio_diffusion_implicit.py
 """
 Bio-Diffusion — синтетический модуль (v0.3).
 
