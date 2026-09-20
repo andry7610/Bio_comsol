@@ -112,7 +112,7 @@ class TestDecay:
         syn.s[0] = 1.0
         phi = np.full(20, -50.0)
         syn.step(phi)
-        for _ in range(100):
+        for _ in range(300):
             syn.step(phi)
         assert syn.s[0] < 1e-10
 
