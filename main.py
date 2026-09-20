@@ -15,13 +15,11 @@ from biological.neuron import NeuronLayer
 
 
 def load_config(path):
-    """Загружает YAML-конфиг."""
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
 
 def build_graph(cfg):
-    """Создаёт граф из секции 'graph' конфига."""
     g = cfg.get('graph', {})
     return Graph(
         N=g.get('N', 20),
@@ -34,7 +32,6 @@ def build_graph(cfg):
 
 
 def build_ions(cfg):
-    """Создаёт список ионов из секции 'ion_species' конфига."""
     species = cfg.get('ion_species', {})
     ions = []
     for name, params in species.items():
@@ -50,7 +47,6 @@ def build_ions(cfg):
 
 
 def build_solver(cfg, graph, ions):
-    """Создаёт BiologicalDiffusion из конфига."""
     phys = cfg.get('physics_constants', {})
     solver_cfg = cfg.get('solver', {})
 
@@ -70,11 +66,13 @@ def build_solver(cfg, graph, ions):
         analyze_every=solver_cfg.get('analyze_every', 0),
         self_consistent=solver_cfg.get('self_consistent', False),
         poisson_lambda=solver_cfg.get('poisson_lambda', 1.0),
+        use_newton=solver_cfg.get('use_newton', False),
+        newton_tol=solver_cfg.get('newton_tol', 1e-8),
+        newton_max_iter=solver_cfg.get('newton_max_iter', 5),
     )
 
 
 def build_neuron(cfg, graph):
-    """Создаёт NeuronLayer из секции 'neuron' конфига."""
     n = cfg.get('neuron', {})
     if not n.get('enabled', False):
         return None
@@ -88,16 +86,6 @@ def build_neuron(cfg, graph):
 
 
 def run_simulation(cfg, n_steps=None, output_every=None):
-    """Запускает симуляцию из конфига.
-
-    Args:
-        cfg: загруженный конфиг (dict)
-        n_steps: число шагов (если None — берётся из cfg['simulation'])
-        output_every: частота вывода (если None — из cfg['simulation'])
-
-    Returns:
-        (solver, neuron) — объекты после симуляции
-    """
     sim_cfg = cfg.get('simulation', {})
     n_steps = n_steps if n_steps is not None else sim_cfg.get('n_steps', 100)
     output_every = (output_every if output_every is not None
@@ -116,6 +104,7 @@ def run_simulation(cfg, n_steps=None, output_every=None):
         print(f"    Узлы: {list(neuron.neuron_indices)}")
         print(f"    Нернст: {'да' if neuron.use_nernst else 'нет'}")
     print(f"  Самосогласование: {'да' if solver.self_consistent else 'нет'}")
+    print(f"  Метод: {'Ньютон' if solver.use_newton else 'Пикар'}")
     print(f"  Шагов: {n_steps}")
     print(f"  dt: {solver.dt}")
     print()
@@ -129,7 +118,8 @@ def run_simulation(cfg, n_steps=None, output_every=None):
         if (step + 1) % output_every == 0:
             qn_err = solver.quasineutrality_error()
             charge = solver.total_charge()
-            print(f"  Шаг {step + 1:5d} | Пикар: {iters} | "
+            method = "N" if solver.use_newton else "P"
+            print(f"  Шаг {step + 1:5d} | {method}: {iters} | "
                   f"квазинейтральность: {qn_err:.2e} | "
                   f"заряд: {charge:.2e}")
 
@@ -154,3 +144,4 @@ def main():
 if __name__ == '__main__':
     main()
 # === END ===
+
