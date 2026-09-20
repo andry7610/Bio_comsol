@@ -1,159 +1,315 @@
-"""biological/neuron.py — Активный нейро-слой на базе квазинейтральной модели.
+"""biological/neuron.py — Модель Ходжкина-Хаксли на графе.
 
-Реализует упрощённую модель Ходжкина-Хаксли (Na/K каналы) в выделенных узлах.
-Поддерживает динамический расчёт равновесных потенциалов по формуле Нернста.
+Версия: v0.6.2
+  - np.clip(V, -100, 100) в rate-функциях — защита от overflow exp
+  - np.errstate в rate-функциях — подавление RuntimeWarning
+
+Версия: v0.6
+  - Динамический Нернст: E_Na, E_K из концентраций
+  - use_nernst флаг
+
+Версия: v0.5
+  - ИИ-интеграция (network/) — автоанализ состояния нейрона
 """
 
 import numpy as np
-
-R = 8.314
-T = 310.0
-F = 96485.0
-RT_OVER_F = R * T / F * 1000.0
+from network import get_backend, AnalysisResult
 
 
 class NeuronLayer:
-    """Нейро-слой, накладываемый на граф Bio-COMSOL."""
+    """Слой нейронов Ходжкина-Хаксли на графе.
 
-    def __init__(self, graph, neuron_nodes, dt=1e-3,
-                 use_nernst=False, na_index=0, k_index=1):
+    Parameters
+    ----------
+    graph : Graph
+        Граф из network.graph.
+    neuron_nodes : list
+        Индексы узлов графа, где расположены нейроны.
+    dt : float
+        Шаг по времени (с).
+    use_nernst : bool
+        Если True — равновесные потенциалы E_Na, E_K считаются
+        динамически из концентраций (уравнение Нернста).
+    """
+
+    def __init__(self, graph, neuron_nodes=None, dt=0.01,
+                 use_nernst=False,
+                 g_Na=120.0, g_K=36.0, g_L=0.3,
+                 E_Na=50.0, E_K=-75.0, E_L=-54.3,
+                 C_m=1.0, V_rest=-65.0,
+                 V_clip_min=-90.0, V_clip_max=60.0,
+                 ai_backend=None, analyze_every=0):
+
+        self.graph = graph
         self.N = graph.N
-        self.neuron_indices = np.array(neuron_nodes)
+        self.neuron_indices = (np.array(neuron_nodes, dtype=int)
+                               if neuron_nodes else np.array([], dtype=int))
+        self.n_neurons = len(self.neuron_indices)
         self.dt = dt
         self.use_nernst = use_nernst
-        self.na_index = na_index
-        self.k_index = k_index
 
-        self.g_Na = 120.0
-        self.E_Na = 50.0
-        self.g_K = 36.0
-        self.E_K = -75.0
-        self.g_L = 0.3
-        self.E_L = -54.3
+        # Проводимости ионных каналов (mS/cm²)
+        self.g_Na = g_Na
+        self.g_K = g_K
+        self.g_L = g_L
 
-        self.m = np.full(len(neuron_nodes), 0.05)
-        self.h = np.full(len(neuron_nodes), 0.6)
-        self.n = np.full(len(neuron_nodes), 0.32)
+        # Равновесные потенциалы (мВ)
+        self.E_Na = E_Na
+        self.E_K = E_K
+        self.E_L = E_L
 
-        self.last_current = np.zeros(len(neuron_nodes))
+        # Динамические равновесные потенциалы (None, пока не вычислены)
         self.E_Na_dynamic = None
         self.E_K_dynamic = None
 
-    @staticmethod
-    def _alpha_m(V):
-        if V == -40:
-            return 0.1
-        return 0.1 * (V + 40.0) / (1.0 - np.exp(-0.1 * (V + 40.0)))
+        # Ёмкость мембраны (мкФ/cm²)
+        self.C_m = C_m
 
-    @staticmethod
-    def _beta_m(V):
-        return 4.0 * np.exp(-(V + 65.0) / 18.0)
+        # Потенциал покоя (мВ)
+        self.V_rest = V_rest
 
-    @staticmethod
-    def _alpha_h(V):
-        return 0.07 * np.exp(-(V + 65.0) / 20.0)
+        # Ограничения потенциала
+        self.V_clip_min = V_clip_min
+        self.V_clip_max = V_clip_max
 
-    @staticmethod
-    def _beta_h(V):
+        # Ворота Ходжкина-Хаксли
+        self.m = np.zeros(self.n_neurons)
+        self.h = np.zeros(self.n_neurons)
+        self.n = np.zeros(self.n_neurons)
+
+        # Инициализация ворот в стационарном состоянии при V_rest
+        if self.n_neurons > 0:
+            V_init = np.full(self.n_neurons, V_rest)
+            a_m = self._alpha_m(V_init)
+            b_m = self._beta_m(V_init)
+            a_h = self._alpha_h(V_init)
+            b_h = self._beta_h(V_init)
+            a_n = self._alpha_n(V_init)
+            b_n = self._beta_n(V_init)
+
+            self.m = a_m / (a_m + b_m)
+            self.h = a_h / (a_h + b_h)
+            self.n = a_n / (a_n + b_n)
+
+        # ИИ-бэкенд
+        self.ai_backend = ai_backend or get_backend()
+        self.analyze_every = analyze_every
+        self.last_analysis = None
+        self.step_count = 0
+
+    # --- Rate-функции Ходжкина-Хаксли ---
+
+    def _alpha_m(self, V):
+        V = np.clip(V, -100.0, 100.0)
+        x = V + 40.0
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            result = 0.1 * x / (1.0 - np.exp(-0.1 * x))
+        result = np.where(np.abs(x) < 1e-6, 1.0, result)
+        return result
+
+    def _beta_m(self, V):
+        V = np.clip(V, -100.0, 100.0)
+        return 4.0 * np.exp(-V / 18.0)
+
+    def _alpha_h(self, V):
+        V = np.clip(V, -100.0, 100.0)
+        return 0.07 * np.exp(-V / 20.0)
+
+    def _beta_h(self, V):
+        V = np.clip(V, -100.0, 100.0)
         return 1.0 / (1.0 + np.exp(-0.1 * (V + 35.0)))
 
-    @staticmethod
-    def _alpha_n(V):
-        if V == -55:
-            return 0.01
-        return 0.01 * (V + 55.0) / (1.0 - np.exp(-0.1 * (V + 55.0)))
+    def _alpha_n(self, V):
+        V = np.clip(V, -100.0, 100.0)
+        x = V + 55.0
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            result = 0.01 * x / (1.0 - np.exp(-0.1 * x))
+        result = np.where(np.abs(x) < 1e-6, 0.1, result)
+        return result
 
-    @staticmethod
-    def _beta_n(V):
-        return 0.125 * np.exp(-(V + 65.0) / 80.0)
+    def _beta_n(self, V):
+        V = np.clip(V, -100.0, 100.0)
+        return 0.125 * np.exp(-V / 80.0)
 
-    def update_gates(self, V_neurons):
-        for idx in range(len(V_neurons)):
-            V = V_neurons[idx]
-            am = self._alpha_m(V)
-            bm = self._beta_m(V)
-            ah = self._alpha_h(V)
-            bh = self._beta_h(V)
-            an = self._alpha_n(V)
-            bn = self._beta_n(V)
+    # --- Обновление ворот ---
 
-            tau_m = 1.0 / (am + bm)
-            tau_h = 1.0 / (ah + bh)
-            tau_n = 1.0 / (an + bn)
+    def update_gates(self, V, dt=None):
+        """Обновляет ворота m, h, n по схеме forward Euler."""
+        if self.n_neurons == 0:
+            return
 
-            m_inf = am / (am + bm)
-            h_inf = ah / (ah + bh)
-            n_inf = an / (an + bn)
+        dt = dt if dt is not None else self.dt
+        V = np.clip(V, -100.0, 100.0)
 
-            self.m[idx] = m_inf + (self.m[idx] - m_inf) * np.exp(-self.dt / tau_m)
-            self.h[idx] = h_inf + (self.h[idx] - h_inf) * np.exp(-self.dt / tau_h)
-            self.n[idx] = n_inf + (self.n[idx] - n_inf) * np.exp(-self.dt / tau_n)
+        a_m = self._alpha_m(V)
+        b_m = self._beta_m(V)
+        a_h = self._alpha_h(V)
+        b_h = self._beta_h(V)
+        a_n = self._alpha_n(V)
+        b_n = self._beta_n(V)
+
+        dm = a_m * (1.0 - self.m) - b_m * self.m
+        dh = a_h * (1.0 - self.h) - b_h * self.h
+        dn = a_n * (1.0 - self.n) - b_n * self.n
+
+        self.m = np.clip(self.m + dt * dm, 0.0, 1.0)
+        self.h = np.clip(self.h + dt * dh, 0.0, 1.0)
+        self.n = np.clip(self.n + dt * dn, 0.0, 1.0)
+
+    # --- Расчёт тока ---
+
+    def compute_current(self, V, c_ions=None, z_ions=None):
+        """Вычисляет ионный ток через мембрану.
+
+        I = g_Na * m³ * h * (V - E_Na) +
+            g_K  * n⁴ *     (V - E_K)  +
+            g_L  *           (V - E_L)
+
+        Если use_nernst=True и переданы c_ions, то E_Na и E_K
+        пересчитываются динамически через compute_nernst.
+        """
+        if self.n_neurons == 0:
+            return np.array([])
+
+        # Динамический Нернст
+        if self.use_nernst and c_ions is not None:
+            if z_ions is None:
+                z_ions = np.array([1, 1, -1, 2])  # Na, K, Cl, Ca
+            self.compute_nernst(c_ions, z_ions)
+
+        # Выбор E_Na, E_K
+        if self.use_nernst and self.E_Na_dynamic is not None:
+            E_Na = self.E_Na_dynamic
+            E_K = self.E_K_dynamic
+        else:
+            E_Na = self.E_Na
+            E_K = self.E_K
+
+        I = (self.g_Na * self.m**3 * self.h * (V - E_Na) +
+             self.g_K * self.n**4 * (V - E_K) +
+             self.g_L * (V - self.E_L))
+
+        return I
+
+    # --- Динамический Нернст ---
 
     def compute_nernst(self, c_global, z_ions):
-        n_neurons = len(self.neuron_indices)
-        if n_neurons == 0:
+        """Вычисляет равновесные потенциалы из уравнения Нернста.
+
+        E = (RT / (z * F)) * ln(c_out / c_in)
+
+        Returns (E_Na, E_K) для узлов-нейронов.
+        При NaN/inf (нулевые концентрации) — fallback на статические E.
+        """
+        if self.n_neurons == 0:
+            self.E_Na_dynamic = np.array([])
+            self.E_K_dynamic = np.array([])
             return np.array([]), np.array([])
 
-        nodes = self.neuron_indices
+        RT_F = 26.7  # мВ, RT/F при T=310 K
 
-        z_na = z_ions[self.na_index]
-        c_na_all = c_global[self.na_index]
-        c_na_out = np.mean(c_na_all)
-        c_na_in = c_na_all[nodes]
+        # Na (индекс 0)
+        c_out_Na = np.mean(c_global[0])
+        c_in_Na = c_global[0][self.neuron_indices]
 
-        with np.errstate(divide='ignore', invalid='ignore'):
-            E_Na = (RT_OVER_F / z_na) * np.log(c_na_out / c_na_in)
-        E_Na = np.nan_to_num(E_Na, nan=self.E_Na, posinf=self.E_Na, neginf=self.E_Na)
-
-        z_k = z_ions[self.k_index]
-        c_k_all = c_global[self.k_index]
-        c_k_out = np.mean(c_k_all)
-        c_k_in = c_k_all[nodes]
+        # K (индекс 1)
+        c_out_K = np.mean(c_global[1])
+        c_in_K = c_global[1][self.neuron_indices]
 
         with np.errstate(divide='ignore', invalid='ignore'):
-            E_K = (RT_OVER_F / z_k) * np.log(c_k_out / c_k_in)
-        E_K = np.nan_to_num(E_K, nan=self.E_K, posinf=self.E_K, neginf=self.E_K)
+            E_Na = (RT_F / z_ions[0]) * np.log(c_out_Na / c_in_Na)
+            E_K = (RT_F / z_ions[1]) * np.log(c_out_K / c_in_K)
+
+        # Защита от NaN / inf
+        E_Na = np.where(np.isnan(E_Na) | np.isinf(E_Na), self.E_Na, E_Na)
+        E_K = np.where(np.isnan(E_K) | np.isinf(E_K), self.E_K, E_K)
 
         self.E_Na_dynamic = E_Na
         self.E_K_dynamic = E_K
 
         return E_Na, E_K
 
-    def compute_current(self, V_neurons, c_ions=None, z_ions=None):
-        if self.use_nernst and c_ions is not None and z_ions is not None:
-            E_Na, E_K = self.compute_nernst(c_ions, z_ions)
+    # --- Применение к графу ---
+
+    def apply_to_graph(self, phi, c=None):
+        """Обновляет потенциал на узлах-нейронах.
+
+        Parameters
+        ----------
+        phi : np.ndarray
+            Потенциал на графе (N,).
+        c : np.ndarray, optional
+            Концентрации ионов (n_ions, N) — для динамического Нернста.
+
+        Returns
+        -------
+        np.ndarray
+            Обновлённый потенциал (N,).
+        """
+        if self.n_neurons == 0:
+            return phi.copy()
+
+        phi = phi.copy()
+        V = phi[self.neuron_indices]
+
+        self.update_gates(V, self.dt)
+
+        if c is not None:
+            I = self.compute_current(V, c_ions=c)
         else:
-            E_Na = self.E_Na
-            E_K = self.E_K
+            I = self.compute_current(V)
 
-        I_Na = self.g_Na * (self.m ** 3) * self.h * (V_neurons - E_Na)
-        I_K = self.g_K * (self.n ** 4) * (V_neurons - E_K)
-        I_L = self.g_L * (V_neurons - self.E_L)
+        # C_m * dV/dt = -I  →  V_new = V - dt * I / C_m
+        V_new = V - self.dt * I / self.C_m
+        V_new = np.clip(V_new, self.V_clip_min, self.V_clip_max)
+        phi[self.neuron_indices] = V_new
 
-        I_total = I_Na + I_K + I_L
-        self.last_current = I_total
-        return I_total
+        self.step_count += 1
 
-    def apply_to_graph(self, phi_global, c_global=None):
-        if len(self.neuron_indices) == 0:
-            return phi_global
+        # Периодический ИИ-анализ
+        if self.analyze_every > 0 and self.step_count % self.analyze_every == 0:
+            self.analyze_state()
 
-        V_local = phi_global[self.neuron_indices]
-        self.update_gates(V_local)
+        return phi
 
-        if self.use_nernst and c_global is not None:
-            z_ions = np.array([1, 1, -1, 2])
-            I = self.compute_current(V_local, c_global, z_ions)
-        else:
-            I = self.compute_current(V_local)
+    # --- ИИ-анализ ---
 
-        C_m = 1.0
-        dV = -I * self.dt / C_m
-        V_new = V_local + dV
-        V_new = np.clip(V_new, -90.0, 60.0)
+    def analyze_state(self):
+        """Анализ текущего состояния нейрона через ИИ-бэкенд."""
+        context = {
+            "neuron_indices": self.neuron_indices,
+            "V_rest": self.V_rest,
+            "g_Na": self.g_Na,
+            "g_K": self.g_K,
+            "g_L": self.g_L,
+            "E_Na": self.E_Na,
+            "E_K": self.E_K,
+            "E_L": self.E_L,
+            "C_m": self.C_m,
+            "dt": self.dt,
+            "use_nernst": self.use_nernst,
+        }
+        self.last_analysis = self.ai_backend.analyze(
+            concentrations=np.stack([self.m, self.h, self.n]) if self.n_neurons > 0 else np.zeros((3, 0)),
+            charges=np.array([1, 1, 1]),
+            time_step=self.step_count,
+            context=context,
+        )
+        return self.last_analysis
 
-        phi_updated = phi_global.copy()
-        phi_updated[self.neuron_indices] = V_new
-
-        return phi_updated
+    def validate_params(self):
+        """Проверка параметров нейрона через ИИ-бэкенд."""
+        params = {
+            "dt": self.dt,
+            "g_Na": self.g_Na,
+            "g_K": self.g_K,
+            "g_L": self.g_L,
+            "E_Na": self.E_Na,
+            "E_K": self.E_K,
+            "E_L": self.E_L,
+            "C_m": self.C_m,
+            "V_rest": self.V_rest,
+            "use_nernst": self.use_nernst,
+        }
+        return self.ai_backend.validate_params(params)
 # === END ===
