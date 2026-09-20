@@ -2,15 +2,10 @@
 
 Версия: v0.9
   - STDP (spike-timing-dependent plasticity)
-  - Обнаружение спайков presinaptic и postsynaptic
-  - LTP: pre до post → weight растёт
-  - LTD: post до pre → weight падает
+  - Отслеживание времён спайков pre и post
+  - LTP: pre до post → Δw = +A+·exp(-Δt/τ+)
+  - LTD: post до pre → Δw = -A-·exp(-Δt/τ-)
   - Ограничение весов [w_min, w_max]
-
-Версия: v0.8
-  - Проводимостная модель синапса
-  - Обнаружение спайков по пересечению порога
-  - Экспоненциальное затухание s
 """
 
 import numpy as np
@@ -31,17 +26,15 @@ class SynapseLayer:
     use_stdp : bool
         Включить spike-timing-dependent plasticity.
     A_plus : float
-        Амплитуда LTP (pre до post).
+        Амплитуда LTP.
     A_minus : float
-        Амплитуда LTD (post до pre).
+        Амплитуда LTD.
     tau_plus : float
-        Окно LTP (в ед. dt).
+        Окно LTP (в единицах dt).
     tau_minus : float
-        Окно LTD (в ед. dt).
+        Окно LTD (в единицах dt).
     w_min : float
-        Минимальный вес.
     w_max : float
-        Максимальный вес.
     """
 
     def __init__(self, graph, synapses, dt=0.01, V_threshold=-20.0,
@@ -90,9 +83,9 @@ class SynapseLayer:
         self.w_min = w_min
         self.w_max = w_max
 
-        # Время последнего спайка для каждого pre и post
-        self.t_pre_last = np.full(self.n_syn, -np.inf)
-        self.t_post_last = np.full(self.n_syn, -np.inf)
+        # Время последнего спайка (в шагах симуляции)
+        self.t_pre_last = np.full(max(self.n_syn, 1), -1e10)
+        self.t_post_last = np.full(max(self.n_syn, 1), -1e10)
         self.sim_time = 0.0
 
         self.ai_backend = ai_backend or get_backend()
@@ -153,34 +146,18 @@ class SynapseLayer:
     def _apply_stdp(self, pre_spikes, post_spikes):
         """Применяет правило STDP к весам.
 
-        LTP: pre спайк → проверяем, не было ли post спайка недавно
-             (pre до post = Δt > 0 → усиливаем)
-        LTD: post спайк → проверяем, не было ли pre спайка недавно
-             (post до pre = Δt < 0 → ослабляем)
+        Δt = t_post - t_pre
+
+        LTP (Δt > 0, pre до post):
+            Δw = +A+ · exp(-Δt / τ+)
+
+        LTD (Δt < 0, post до pre):
+            Δw = -A- · exp(Δt / τ-)
         """
-        # LTP: pre спайк, post уже стрелял до этого
-        for i in np.where(pre_spikes)[0]:
-            dt_post = self.sim_time - self.t_post_last[i]
-            if 0 < dt_post < self.tau_plus * self.dt * 100:
-                # post стрелял до pre → Δt = t_post - t_pre < 0
-                # Но это LTD (post до pre), не LTP
-                pass
+        if self.n_syn == 0:
+            return
 
-            dt_pre = self.sim_time - self.t_pre_last[i]
-            # Если pre стрелял сейчас, и post стрелял позже → LTP
-            # Но post ещё не стрелял в этом шаге, значит post после pre
-            # → это потенциальный LTP, но мы узнаём только когда post стрелянет
-
-        # LTD: post спайк, pre уже стрелял до этого
-        for i in np.where(post_spikes)[0]:
-            dt = self.sim_time - self.t_pre_last[i]
-            if 0 < dt < self.tau_minus * self.dt * 100:
-                # pre стрелял до post → LTP (усиление)
-                dw = self.A_plus * np.exp(-dt / (self.tau_minus * self.dt))
-                self.weights[i] = np.clip(
-                    self.weights[i] + dw, self.w_min, self.w_max)
-
-        # LTP: post спайк произошёл после pre
+        # LTP: post спайк, pre уже стрелял раньше → pre до post
         for i in np.where(post_spikes)[0]:
             dt = self.sim_time - self.t_pre_last[i]
             if 0 < dt < self.tau_plus * self.dt * 100:
@@ -188,7 +165,7 @@ class SynapseLayer:
                 self.weights[i] = np.clip(
                     self.weights[i] + dw, self.w_min, self.w_max)
 
-        # LTD: pre спайк произошёл после post
+        # LTD: pre спайк, post уже стрелял раньше → post до pre
         for i in np.where(pre_spikes)[0]:
             dt = self.sim_time - self.t_post_last[i]
             if 0 < dt < self.tau_minus * self.dt * 100:
