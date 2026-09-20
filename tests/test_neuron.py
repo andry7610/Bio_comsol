@@ -317,3 +317,50 @@ class TestFullChain:
             sim.phi = neuron_layer.apply_to_graph(sim.phi, sim.c)
         assert np.all(np.isfinite(sim.c))
         assert np.all(np.isfinite(sim.phi))
+
+class TestNernst:
+    """Тесты динамического расчёта равновесных потенциалов Нернста."""
+
+    @pytest.fixture
+    def graph(self):
+        return Graph(N=20, topology="chain")
+
+    @pytest.fixture
+    def neuron(self, graph):
+        return NeuronLayer(graph, neuron_nodes=[5, 10, 15],
+                          dt=0.01, use_nernst=True)
+
+    @pytest.fixture
+    def c_global(self):
+        """Концентрации (4 иона, 20 узлов) — однородные."""
+        c = np.zeros((4, 20))
+        c[0] = 145.0   # Na
+        c[1] = 4.0     # K
+        c[2] = 110.0   # Cl
+        c[3] = 1.0     # Ca
+        return c
+
+    @pytest.fixture
+    def z_ions(self):
+        return np.array([1, 1, -1, 2])
+
+    def test_nernst_returns_arrays(self, neuron, c_global, z_ions):
+        """compute_nernst возвращает массивы правильной длины."""
+        E_Na, E_K = neuron.compute_nernst(c_global, z_ions)
+        assert len(E_Na) == 3
+        assert len(E_K) == 3
+
+    def test_nernst_uniform_concentration(self, neuron, c_global, z_ions):
+        """Однородные концентрации → E = 0 (log(1) = 0)."""
+        E_Na, E_K = neuron.compute_nernst(c_global, z_ions)
+        assert np.allclose(E_Na, 0.0, atol=1e-10)
+        assert np.allclose(E_K, 0.0, atol=1e-10)
+
+    def test_nernst_E_Na_value(self, neuron, z_ions):
+        """E_Na = (RT/F) · ln(c_out / c_in) при z = 1."""
+        c = np.zeros((4, 20))
+        c[0] = 145.0
+        c[0][[5, 10, 15]] = 10.0
+        # c_out = mean = (17·145 + 3·10) / 20 = 124.75
+        # c_in = 10 → E_Na = 26.7 · ln(12.475) ≈ 67.4 мВ
+        E_Na, _ = neuron.compute_nernst(c, z_ions)
