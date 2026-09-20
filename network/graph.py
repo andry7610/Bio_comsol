@@ -1,5 +1,4 @@
-"""
-network/graph.py — Графовая топология для GAK-WaveCAD.
+"""network/graph.py — Графовая топология для GAK-WaveCAD.
 v0.3.1: Координаты узлов, метрические веса, метод neighbors().
 """
 import numpy as np
@@ -85,10 +84,9 @@ class Graph:
         # --- Лапласиан ---
         self.W = sparse.csr_matrix(W)
         D = sparse.diags(W.sum(axis=1).ravel())
-        self.L_dense = (D - self.W).toarray()
-        self.L_csr = sparse.csr_matrix(
-            self.L_dense + 1e-8 * sparse.eye(N)
-        )
+        L_sparse = D - self.W
+        self.L_dense = L_sparse.toarray()
+        self.L_csr = L_sparse + 1e-8 * sparse.eye(N)
 
         # --- Список рёбер ---
         self.edges = []
@@ -103,4 +101,10 @@ class Graph:
 
     @property
     def laplacian(self):
+        """Разреженный лапласиан с регуляризацией — для численных модулей."""
+        return self.L_csr
+
+    @property
+    def laplacian_dense(self):
+        """Плотный лапласиан без регуляризации — для визуализации/отладки."""
         return self.L_dense
