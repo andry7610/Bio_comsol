@@ -1,8 +1,13 @@
 """biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
 
-Версия: v0.5
+Версия: v0.6.1
 
-Отличия от v0.4:
+Отличия от v0.5:
+  - Самосогласованный потенциал из уравнения Пуассона на графе
+  - Флаг self_consistent — по умолчанию выключен (обратная совместимость)
+  - _solve_poisson() — L·φ = -λ·ρ с граничными условиями Дирихле
+
+Версия: v0.5
   - Интеграция ИИ-бэкендов (network/) — автоанализ симуляции
   - Метод analyze_state() — вызов нейросети в любой момент
   - Метод validate_params() — проверка параметров перед запуском
@@ -15,10 +20,9 @@
   - Итерации Пикара для электродиффузионного члена
   - Потенциал φ — внешний (фиксированный), не самостоясогласованный
 
-План на v0.6:
-  - Самостоясогласованный потенциал из условия квазинейтральности
-  - Метод Ньютона
-  - Активные ионные каналы (Hodgkin-Huxley)
+План на v0.7:
+  - Метод Ньютона для жёсткой связи φ ↔ c
+  - Аналитический якобиан
 """
 
 import numpy as np
@@ -39,7 +43,13 @@ class BiologicalDiffusion:
 
         Σ_k z_k · c_k ≈ 0  в каждом узле
 
-    Мембранный потенциал:
+    Самосогласованный потенциал (v0.6.1):
+
+        L · φ = -λ · ρ,  ρ = Σ_k z_k · c_k
+
+        Граничные условия: φ[0] = 0, φ[N-1] = φ_membrane.
+
+    Мембранный потенциал (v0.4, без самосогласования):
 
         φ(0) = 0           — внешняя граница (межклетник)
         φ(N-1) = φ_mem     — внутренняя граница (цитоплазма)
@@ -56,7 +66,8 @@ class BiologicalDiffusion:
     def __init__(self, graph, ions, dt=1e-3, F_RT=1.0,
                  membrane_potential=-1.8,
                  picard_tol=1e-6, picard_max_iter=20,
-                 ai_backend=None, analyze_every=0):
+                 ai_backend=None, analyze_every=0,
+                 self_consistent=False, poisson_lambda=1.0):
 
         self.graph = graph
         self.N = graph.N
@@ -67,6 +78,8 @@ class BiologicalDiffusion:
         self.phi_membrane = membrane_potential
         self.picard_tol = picard_tol
         self.picard_max_iter = picard_max_iter
+        self.self_consistent = self_consistent
+        self.poisson_lambda = poisson_lambda
 
         # --- Ионы ---
         self.n_ions = len(ions)
@@ -100,6 +113,14 @@ class BiologicalDiffusion:
                 A[node, :] = 0
                 A[node, node] = 1.0
             self.A_mats.append(A.tocsr())
+
+        # --- Матрица Пуассона для самосогласованного потенциала ---
+        if self_consistent:
+            A_pois = self.L.copy().tolil()
+            for node in self.boundary_nodes:
+                A_pois[node, :] = 0
+                A_pois[node, node] = 1.0
+            self.A_poisson = A_pois.tocsr()
 
         # --- Матрица инцидентности для адвективного члена ---
         self._build_incidence()
@@ -149,6 +170,20 @@ class BiologicalDiffusion:
         flux = D_k * z_k * self.F_RT * c_mid * grad_phi
         return self.B @ flux                        # (N,)
 
+    def _solve_poisson(self):
+        """Самосогласованный потенциал из уравнения Пуассона на графе.
+
+        L · φ = -λ · ρ,  ρ = Σ_k z_k · c_k
+
+        Граничные условия: φ[0] = 0, φ[N-1] = φ_membrane.
+        """
+        rho = np.sum(self.z[:, None] * self.c, axis=0)
+        rhs = -self.poisson_lambda * rho
+        rhs[0] = 0.0
+        if self.N > 1:
+            rhs[self.N - 1] = self.phi_membrane
+        self.phi = spla.spsolve(self.A_poisson, rhs)
+
     # --- Диагностика ---
 
     def total_charge(self):
@@ -176,6 +211,7 @@ class BiologicalDiffusion:
             "phi": self.phi,
             "membrane_potential": self.phi_membrane,
             "dt": self.dt,
+            "self_consistent": self.self_consistent,
         }
         self.last_analysis = self.ai_backend.analyze(
             concentrations=self.c,
@@ -194,6 +230,8 @@ class BiologicalDiffusion:
             "dt": self.dt,
             "F_RT": self.F_RT,
             "membrane_potential": self.phi_membrane,
+            "self_consistent": self.self_consistent,
+            "poisson_lambda": self.poisson_lambda,
             "ions": [
                 {
                     "name": self.names[k],
@@ -218,6 +256,9 @@ class BiologicalDiffusion:
 
         Итерации Пикара: adv_k пересчитывается на каждой итерации
         с обновлёнными концентрациями.
+
+        Если self_consistent=True, после обновления концентраций
+        потенциал φ пересчитывается из уравнения Пуассона.
 
         Если analyze_every > 0, каждые analyze_every шагов
         запускается ИИ-анализ состояния.
@@ -252,8 +293,13 @@ class BiologicalDiffusion:
         self.step_count += 1
         self.last_picard_iters = iteration + 1
 
+        # Самосогласованный потенциал
+        if self.self_consistent:
+            self._solve_poisson()
+
         # Периодический ИИ-анализ
         if self.analyze_every > 0 and self.step_count % self.analyze_every == 0:
             self.analyze_state()
 
         return self.last_picard_iters
+# === END ===
