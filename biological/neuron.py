@@ -3,6 +3,7 @@
 Версия: v0.6.2
   - np.clip(V, -100, 100) в rate-функциях — защита от overflow exp
   - np.errstate в rate-функциях — подавление RuntimeWarning
+  - last_current — сохранение тока для neuron_analysis
 
 Версия: v0.6
   - Динамический Нернст: E_Na, E_K из концентраций
@@ -76,6 +77,7 @@ class NeuronLayer:
         self.m = np.zeros(self.n_neurons)
         self.h = np.zeros(self.n_neurons)
         self.n = np.zeros(self.n_neurons)
+        self.last_current = np.zeros(self.n_neurons)
 
         # Инициализация ворот в стационарном состоянии при V_rest
         if self.n_neurons > 0:
@@ -189,6 +191,7 @@ class NeuronLayer:
              self.g_K * self.n**4 * (V - E_K) +
              self.g_L * (V - self.E_L))
 
+        self.last_current = I
         return I
 
     # --- Динамический Нернст ---
