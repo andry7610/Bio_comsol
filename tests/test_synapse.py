@@ -1,10 +1,14 @@
+"""tests/test_synapse.py — Тесты SynapseLayer (v0.9)."""
+
 import numpy as np
 import pytest
+from unittest.mock import MagicMock
 
 from network.graph import Graph
 from biological.synapse import SynapseLayer
 from biological.neuron import NeuronLayer
 from biological.diffusion import BiologicalDiffusion
+from network import AnalysisResult
 
 
 # --- Инициализация ---
@@ -310,4 +314,248 @@ class TestConfig:
         g = build_graph(cfg)
         syn = build_synapses(cfg, g)
         assert syn is None
+
+    def test_config_stdp_passthrough(self):
+        from main import build_synapses, build_graph
+        cfg = {
+            'graph': {'N': 20, 'topology': 'chain'},
+            'synapse': {
+                'enabled': True,
+                'V_threshold': -30.0,
+                'use_stdp': True,
+                'A_plus': 0.02,
+                'A_minus': 0.025,
+                'tau_plus': 15.0,
+                'tau_minus': 25.0,
+                'w_min': 0.1,
+                'w_max': 8.0,
+                'synapses': [
+                    {'pre': 5, 'post': 10, 'weight': 0.5,
+                     'E_syn': 0.0, 'tau_syn': 3.0},
+                ],
+            },
+        }
+        g = build_graph(cfg)
+        syn = build_synapses(cfg, g)
+        assert syn.use_stdp is True
+        assert syn.A_plus == 0.02
+        assert syn.A_minus == 0.025
+        assert syn.tau_plus == 15.0
+        assert syn.tau_minus == 25.0
+        assert syn.w_min == 0.1
+        assert syn.w_max == 8.0
+
+
+# --- STDP (v0.9) ---
+
+class TestSTDP:
+    """Тесты spike-timing-dependent plasticity."""
+
+    @pytest.fixture
+    def graph(self):
+        return Graph(N=20, topology="chain")
+
+    @pytest.fixture
+    def synapses(self):
+        return [{"pre": 5, "post": 10, "weight": 1.0,
+                 "E_syn": 0.0, "tau_syn": 3.0}]
+
+    def test_stdp_disabled_by_default(self, graph, synapses):
+        syn = SynapseLayer(graph, synapses, dt=0.01)
+        assert syn.use_stdp is False
+
+    def test_stdp_flag_set(self, graph, synapses):
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True)
+        assert syn.use_stdp is True
+
+    def test_stdp_params_set(self, graph, synapses):
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                           A_plus=0.05, A_minus=0.06,
+                           tau_plus=10.0, tau_minus=15.0,
+                           w_min=0.0, w_max=5.0)
+        assert syn.A_plus == 0.05
+        assert syn.A_minus == 0.06
+        assert syn.tau_plus == 10.0
+        assert syn.tau_minus == 15.0
+        assert syn.w_min == 0.0
+        assert syn.w_max == 5.0
+
+    def test_no_weight_change_without_stdp(self, graph, synapses):
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=False)
+        w_before = syn.weights[0]
+        phi = np.full(20, -50.0)
+        syn.step(phi)
+        phi[5] = 0.0
+        syn.step(phi)
+        phi[5] = -50.0
+        phi[10] = 0.0
+        syn.step(phi)
+        assert syn.weights[0] == w_before
+
+    def test_ltp_pre_before_post(self, graph, synapses):
+        """Pre спайк до post → LTP (weight растёт)."""
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                           A_plus=0.1, A_minus=0.1,
+                           tau_plus=20.0, tau_minus=20.0)
+        w_before = syn.weights[0]
+
+        # Шаг 1: нет спайков
+        phi = np.full(20, -50.0)
+        syn.step(phi)
+
+        # Шаг 2: pre спайк
+        phi[5] = 0.0
+        syn.step(phi)
+
+        # Шаг 3: post спайк (через 1 шаг)
+        phi[5] = -50.0
+        phi[10] = 0.0
+        syn.step(phi)
+
+        assert syn.weights[0] > w_before
+
+    def test_ltd_post_before_pre(self, graph, synapses):
+        """Post спайк до pre → LTD (weight падает)."""
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                           A_plus=0.1, A_minus=0.1,
+                           tau_plus=20.0, tau_minus=20.0)
+        w_before = syn.weights[0]
+
+        # Шаг 1: нет спайков
+        phi = np.full(20, -50.0)
+        syn.step(phi)
+
+        # Шаг 2: post спайк
+        phi[10] = 0.0
+        syn.step(phi)
+
+        # Шаг 3: pre спайк (через 1 шаг)
+        phi[10] = -50.0
+        phi[5] = 0.0
+        syn.step(phi)
+
+        assert syn.weights[0] < w_before
+
+    def test_weight_clipped_to_max(self, graph, synapses):
+        """Вес не может превысить w_max."""
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                           A_plus=100.0, A_minus=0.1,
+                           tau_plus=20.0, tau_minus=20.0,
+                           w_max=2.0)
+        phi = np.full(20, -50.0)
+        syn.step(phi)
+        phi[5] = 0.0
+        syn.step(phi)
+        phi[5] = -50.0
+        phi[10] = 0.0
+        syn.step(phi)
+        assert syn.weights[0] <= 2.0
+
+    def test_weight_clipped_to_min(self, graph, synapses):
+        """Вес не может упасть ниже w_min."""
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                           A_plus=0.1, A_minus=100.0,
+                           tau_plus=20.0, tau_minus=20.0,
+                           w_min=0.5)
+        phi = np.full(20, -50.0)
+        syn.step(phi)
+        phi[10] = 0.0
+        syn.step(phi)
+        phi[10] = -50.0
+        phi[5] = 0.0
+        syn.step(phi)
+        assert syn.weights[0] >= 0.5
+
+    def test_no_change_when_no_correlation(self, graph, synapses):
+        """Нет спайков → вес не меняется."""
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True)
+        w_before = syn.weights[0]
+        phi = np.full(20, -50.0)
+        for _ in range(100):
+            syn.step(phi)
+        assert abs(syn.weights[0] - w_before) < 1e-15
+
+    def test_stdp_decay_with_timing(self, graph, synapses):
+        """Чем больше задержка между спайками, тем меньше изменение веса."""
+        # Быстрая пара
+        syn_fast = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                                A_plus=0.1, tau_plus=20.0,
+                                tau_minus=20.0, A_minus=0.1)
+        w_fast = syn_fast.weights[0]
+
+        phi = np.full(20, -50.0)
+        syn_fast.step(phi)
+        phi[5] = 0.0
+        syn_fast.step(phi)
+        phi[5] = -50.0
+        phi[10] = 0.0
+        syn_fast.step(phi)
+        dw_fast = syn_fast.weights[0] - w_fast
+
+        # Медленная пара (большая задержка)
+        syn_slow = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True,
+                                A_plus=0.1, tau_plus=20.0,
+                                tau_minus=20.0, A_minus=0.1)
+        w_slow = syn_slow.weights[0]
+
+        phi = np.full(20, -50.0)
+        syn_slow.step(phi)
+        phi[5] = 0.0
+        syn_slow.step(phi)
+        phi[5] = -50.0
+        for _ in range(50):
+            syn_slow.step(phi)
+        phi[10] = 0.0
+        syn_slow.step(phi)
+        dw_slow = syn_slow.weights[0] - w_slow
+
+        assert dw_fast > dw_slow
+        assert dw_slow > 0  # всё ещё LTP, но слабее
+
+    def test_stdp_stable_long_run(self, graph):
+        """STDP в длинном цикле — без NaN и взрывов."""
+        synapses = [
+            {"pre": 5, "post": 10, "weight": 1.0,
+             "E_syn": 0.0, "tau_syn": 3.0},
+            {"pre": 10, "post": 15, "weight": 0.5,
+             "E_syn": 0.0, "tau_syn": 3.0},
+        ]
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True)
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], dt=0.01)
+        phi = np.full(20, -65.0)
+        for _ in range(200):
+            syn.step(phi)
+            I_ext = syn.get_current_array(phi, neuron.neuron_indices)
+            phi = neuron.apply_to_graph(phi, I_ext=I_ext)
+        assert not np.any(np.isnan(phi))
+        assert np.all(syn.weights >= syn.w_min - 1e-10)
+        assert np.all(syn.weights <= syn.w_max + 1e-10)
+
+    def test_stdp_with_diffusion_stable(self, graph):
+        """Полный цикл: диффузия + нейрон + синапс + STDP."""
+        ions = [
+            {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0},
+            {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0},
+            {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0},
+            {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0},
+        ]
+        solver = BiologicalDiffusion(graph, ions, dt=0.01)
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], dt=0.01)
+        synapses = [
+            {"pre": 5, "post": 10, "weight": 1.0,
+             "E_syn": 0.0, "tau_syn": 3.0},
+            {"pre": 10, "post": 15, "weight": 0.5,
+             "E_syn": 0.0, "tau_syn": 3.0},
+        ]
+        syn = SynapseLayer(graph, synapses, dt=0.01, use_stdp=True)
+        for _ in range(50):
+            solver.step()
+            syn.step(solver.phi)
+            I_ext = syn.get_current_array(solver.phi, neuron.neuron_indices)
+            solver.phi = neuron.apply_to_graph(
+                solver.phi, solver.c, I_ext=I_ext)
+        assert not np.any(np.isnan(solver.c))
+        assert not np.any(np.isnan(solver.phi))
+        assert np.all(syn.weights >= -1e-10)
+        assert np.all(syn.weights < 1e6)
 # === END ===
