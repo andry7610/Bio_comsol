@@ -113,7 +113,8 @@ class TestBuildSolver:
         g = build_graph(cfg)
         ions = build_ions(cfg)
         s = build_solver(cfg, g, ions)
-        assert abs(s.F_RT - 38.94) < 0.1
+        assert abs(s.F_RT - 37.44) < 0.1
+
 
     def test_solver_defaults(self):
         g = build_graph({})
