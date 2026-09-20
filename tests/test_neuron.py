@@ -364,3 +364,74 @@ class TestNernst:
         # c_out = mean = (17·145 + 3·10) / 20 = 124.75
         # c_in = 10 → E_Na = 26.7 · ln(12.475) ≈ 67.4 мВ
         E_Na, _ = neuron.compute_nernst(c, z_ions)
+
+    def test_nernst_E_K_value(self, neuron, z_ions):
+        """E_K = (RT/F) · ln(c_out / c_in) при z = 1."""
+        c = np.zeros((4, 20))
+        c[1] = 4.0
+        c[1][[5, 10, 15]] = 100.0
+        _, E_K = neuron.compute_nernst(c, z_ions)
+        expected = 26.7 * np.log(18.4 / 100.0)
+        assert np.allclose(E_K, expected, rtol=0.01)
+
+    def test_nernst_nan_protection(self, neuron, z_ions):
+        """Нулевые концентрации → NaN → fallback на статические E."""
+        c = np.zeros((4, 20))
+        E_Na, E_K = neuron.compute_nernst(c, z_ions)
+        assert not np.any(np.isnan(E_Na))
+        assert not np.any(np.isnan(E_K))
+        assert np.allclose(E_Na, neuron.E_Na)
+        assert np.allclose(E_K, neuron.E_K)
+
+    def test_nernst_empty_neuron(self, graph):
+        """Пустые neuron_indices → пустые массивы, без краша."""
+        neuron = NeuronLayer(graph, neuron_nodes=[], use_nernst=True)
+        c = np.zeros((4, 20))
+        z = np.array([1, 1, -1, 2])
+        E_Na, E_K = neuron.compute_nernst(c, z)
+        assert len(E_Na) == 0
+        assert len(E_K) == 0
+
+    def test_nernst_stored_dynamic(self, neuron, c_global, z_ions):
+        """E_Na_dynamic и E_K_dynamic сохраняются после compute_nernst."""
+        assert neuron.E_Na_dynamic is None
+        assert neuron.E_K_dynamic is None
+        neuron.compute_nernst(c_global, z_ions)
+        assert neuron.E_Na_dynamic is not None
+        assert neuron.E_K_dynamic is not None
+
+    def test_compute_current_uses_nernst(self, graph):
+        """use_nernst=True → compute_current вызывает compute_nernst."""
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], use_nernst=True)
+        V = np.array([-65.0, -65.0, -65.0])
+        c = np.zeros((4, 20))
+        c[0] = 145.0
+        c[1] = 4.0
+        z = np.array([1, 1, -1, 2])
+        I = neuron.compute_current(V, c_ions=c, z_ions=z)
+        assert len(I) == 3
+        assert neuron.E_Na_dynamic is not None
+
+    def test_compute_current_ignores_nernst(self, graph):
+        """use_nernst=False → статические E, dynamic не считаются."""
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], use_nernst=False)
+        V = np.array([-65.0, -65.0, -65.0])
+        c = np.zeros((4, 20))
+        z = np.array([1, 1, -1, 2])
+        I = neuron.compute_current(V, c_ions=c, z_ions=z)
+        assert len(I) == 3
+        assert neuron.E_Na_dynamic is None
+
+    def test_apply_to_graph_with_nernst(self, graph):
+        """apply_to_graph передаёт концентрации при use_nernst=True."""
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], use_nernst=True)
+        phi = np.linspace(0, -1.8, 20)
+        c = np.zeros((4, 20))
+        c[0] = 145.0
+        c[1] = 4.0
+        c[2] = 110.0
+        c[3] = 1.0
+        phi_new = neuron.apply_to_graph(phi, c)
+        assert phi_new.shape == (20,)
+        assert neuron.E_Na_dynamic is not None
+# === END ===
