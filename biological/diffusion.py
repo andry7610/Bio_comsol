@@ -60,7 +60,7 @@ class BiologicalDiffusion:
 
         self.graph = graph
         self.N = graph.N
-        self.L = sp.csr_matrix(graph.laplacian)
+        self.L = graph.laplacian
         self.edges = graph.edges
         self.dt = dt
         self.F_RT = F_RT
