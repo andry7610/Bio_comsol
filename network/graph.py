@@ -84,7 +84,7 @@ class Graph:
 
         # --- Лапласиан ---
         self.W = sparse.csr_matrix(W)
-        D = sparse.diags(W.sum(axis=1).A1)
+        D = sparse.diags(W.sum(axis=1).ravel())
         self.L_dense = (D - self.W).toarray()
         self.L_csr = sparse.csr_matrix(
             self.L_dense + 1e-8 * sparse.eye(N)
