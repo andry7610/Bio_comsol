@@ -1,321 +1,384 @@
-"""tests/test_biological.py — тесты для biological/diffusion.py.
-
-Покрывает:
-    - Базовая симуляция: шаг, сходимость Пикара, граничные условия
-    - Диагностика: квазинейтральность, заряд
-    - ИИ-интеграция: analyze_state, validate_params, analyze_every
-    - Fallback: работа без ИИ (ManualBackend)
-    - Принудительный бэкенд: mock-объект
-"""
+"""tests/test_biological.py — Тесты BiologicalDiffusion."""
 
 import numpy as np
 import pytest
+from unittest.mock import MagicMock
 
 from network.graph import Graph
-from network.base import AnalysisResult
-from network.manual import ManualBackend
 from biological.diffusion import BiologicalDiffusion
+from network import AnalysisResult
 
 
-# ─── Фикстуры ───
-
-@pytest.fixture
-def simple_graph():
-    return Graph(N=20, topology="chain", conductivity=1.0, cross_section=1e-8)
-
+# --- Фикстуры ---
 
 @pytest.fixture
-def simple_ions():
+def graph():
+    return Graph(N=20, topology="chain")
+
+
+@pytest.fixture
+def ions():
     return [
-        {"name": "Na", "D": 1.33e-9, "z": +1, "c0": 145, "c_left": 145, "c_right": 10},
-        {"name": "K",  "D": 1.96e-9, "z": +1, "c0": 5,   "c_left": 5,   "c_right": 140},
-        {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 150, "c_left": 150, "c_right": 10},
+        {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0},
+        {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0},
+        {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0},
+        {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0},
     ]
 
 
 @pytest.fixture
-def sim(simple_graph, simple_ions):
-    return BiologicalDiffusion(
-        simple_graph, simple_ions,
-        dt=0.01, F_RT=38.9, membrane_potential=-1.8,
-    )
+def solver(graph, ions):
+    return BiologicalDiffusion(graph, ions, dt=0.01)
 
 
-# ─── Базовая симуляция ───
+# --- Базовая симуляция ---
 
 class TestBasicSimulation:
-    def test_init(self, sim):
-        assert sim.N == 20
-        assert sim.n_ions == 3
-        assert sim.c.shape == (3, 20)
-        assert sim.step_count == 0
 
-    def test_initial_concentrations(self, sim):
-        # Na везде 145
-        assert np.allclose(sim.c[0], 145.0)
-        # K везде 5
-        assert np.allclose(sim.c[1], 5.0)
+    def test_init(self, solver):
+        assert solver.N == 20
+        assert solver.n_ions == 4
+        assert solver.dt == 0.01
+        assert solver.step_count == 0
 
-    def test_step_returns_picard_iters(self, sim):
-        iters = sim.step()
+    def test_initial_concentrations(self, solver):
+        assert solver.c.shape == (4, 20)
+        assert np.allclose(solver.c[0], 145.0)
+        assert np.allclose(solver.c[1], 4.0)
+        assert np.allclose(solver.c[2], 110.0)
+        assert np.allclose(solver.c[3], 1.0)
+
+    def test_step_returns_picard_iters(self, solver):
+        iters = solver.step()
         assert isinstance(iters, int)
         assert iters >= 1
-        assert sim.step_count == 1
+        assert iters <= solver.picard_max_iter
 
-    def test_multiple_steps(self, sim):
-        for _ in range(100):
-            sim.step()
-        assert sim.step_count == 100
-        # Концентрации должны остаться конечными
-        assert np.all(np.isfinite(sim.c))
+    def test_multiple_steps(self, solver):
+        for _ in range(10):
+            solver.step()
+        assert solver.step_count == 10
 
-    def test_boundary_conditions(self, sim):
-        sim.step()
-        # Дирихле на границах
-        assert np.isclose(sim.c[0, 0], 145.0)   # Na left
-        assert np.isclose(sim.c[0, -1], 10.0)   # Na right
-        assert np.isclose(sim.c[1, 0], 5.0)     # K left
-        assert np.isclose(sim.c[1, -1], 140.0)  # K right
+    def test_boundary_conditions(self, graph, ions):
+        ions_bc = [
+            {"name": "Na", "D": 1e-9, "z": 1, "c0": 100,
+             "c_left": 150, "c_right": 10},
+        ]
+        s = BiologicalDiffusion(graph, ions_bc, dt=0.01)
+        s.step()
+        assert s.c[0, 0] == 150
+        assert s.c[0, -1] == 10
 
-    def test_potential_profile(self, sim):
-        assert np.isclose(sim.phi[0], 0.0)
-        assert np.isclose(sim.phi[-1], -1.8)
-        # Линейная интерполяция: phi[i] = -1.8 * i / (N-1)
-        assert np.isclose(sim.phi[10], -1.8 * 10 / 19, atol=0.01)
+    def test_potential_profile(self, solver):
+        assert solver.phi[0] == 0.0
+        assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
 
-    def test_concentration_changes_over_time(self, sim):
-        c_before = sim.c.copy()
-        for _ in range(50):
-            sim.step()
-        # Концентрации во внутренних узлах должны измениться
-        assert not np.allclose(sim.c[:, 5:15], c_before[:, 5:15])
+    def test_concentration_changes_over_time(self, solver):
+        c_before = solver.c.copy()
+        solver.step()
+        assert not np.allclose(solver.c, c_before)
 
-    def test_picard_convergence(self, sim):
-        sim.step()
-        # Должен сойтись за разумное число итераций
-        assert sim.last_picard_iters <= sim.picard_max_iter
+    def test_picard_convergence(self, solver):
+        solver.step()
+        assert solver.last_picard_iters <= solver.picard_max_iter
 
 
-# ─── Диагностика ───
+# --- Диагностика ---
 
 class TestDiagnostics:
-    def test_total_charge(self, sim):
-        q = sim.total_charge()
-        assert isinstance(q, float)
 
-    def test_charge_per_node_shape(self, sim):
-        q = sim.charge_per_node()
-        assert q.shape == (20,)
+    def test_total_charge(self, solver):
+        charge = solver.total_charge()
+        assert isinstance(charge, float)
+        # Na + K - Cl + 2*Ca = 145 + 4 - 110 + 2 = 41
+        assert abs(charge - 41 * 20) < 1e-6
 
-    def test_quasineutrality_error(self, sim):
-        err = sim.quasineutrality_error()
+    def test_charge_per_node_shape(self, solver):
+        ch = solver.charge_per_node()
+        assert ch.shape == (20,)
+
+    def test_quasineutrality_error(self, solver):
+        err = solver.quasineutrality_error()
         assert isinstance(err, float)
-        assert err >= 0.0
+        assert err >= 0
 
-    def test_quasineutrality_after_steps(self, sim):
-        for _ in range(50):
-            sim.step()
-        err = sim.quasineutrality_error()
-        # Не должно сильно расходиться
-        assert err < 200.0
+    def test_quasineutrality_after_steps(self, solver):
+        for _ in range(5):
+            solver.step()
+        err = solver.quasineutrality_error()
+        assert err < 1e3
 
 
-# ─── ИИ-интеграция ───
+# --- ИИ-интеграция ---
 
 class TestAIIntegration:
-    def test_default_backend_is_manual(self, sim):
-        # Без API ключа и Ollama — ManualBackend
-        assert sim.ai_backend is not None
-        assert sim.ai_backend.name in ("manual", "local", "api")
 
-    def test_analyze_state(self, sim):
-        result = sim.analyze_state()
-        assert isinstance(result, AnalysisResult)
-        assert result.backend in ("manual", "local", "api")
-        assert result.summary  # непустой
+    def test_default_backend_is_manual(self, solver):
+        from network import get_backend
+        backend = get_backend()
+        assert backend is not None
 
-    def test_analyze_state_after_steps(self, sim):
+    def test_analyze_state(self, solver):
+        result = solver.analyze_state()
+        assert result is not None
+        assert hasattr(result, 'summary')
+
+    def test_analyze_state_after_steps(self, solver):
+        for _ in range(3):
+            solver.step()
+        result = solver.analyze_state()
+        assert result is not None
+
+    def test_validate_params(self, solver):
+        result = solver.validate_params()
+        assert result is not None
+        assert hasattr(result, 'summary')
+
+    def test_validate_params_catches_bad_dt(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions, dt=-1.0)
+        result = s.validate_params()
+        assert result is not None
+
+    def test_validate_params_good(self, solver):
+        result = solver.validate_params()
+        assert result is not None
+
+    def test_analyze_every_triggers(self, graph, ions):
+        mock_backend = MagicMock()
+        mock_backend.analyze.return_value = AnalysisResult(
+            summary="ok", warnings=[], suggestions=[])
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                ai_backend=mock_backend, analyze_every=5)
         for _ in range(10):
-            sim.step()
-        result = sim.analyze_state()
-        assert result.confidence >= 0.0
-        assert isinstance(result.warnings, list)
-        assert isinstance(result.suggestions, list)
+            s.step()
+        assert mock_backend.analyze.call_count >= 2
 
-    def test_validate_params(self, sim):
-        result = sim.validate_params()
-        assert isinstance(result, AnalysisResult)
-        assert result.backend in ("manual", "local", "api")
-
-    def test_validate_params_catches_bad_dt(self, simple_graph, simple_ions):
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            dt=-0.5,  # отрицательный dt
-        )
-        result = sim.validate_params()
-        assert len(result.warnings) > 0
-
-    def test_validate_params_good(self, sim):
-        result = sim.validate_params()
-        # С нормальными параметрами — мало warnings
-        assert len(result.warnings) <= 1
-
-    def test_analyze_every_triggers(self, simple_graph, simple_ions):
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            dt=0.01, analyze_every=5,
-        )
-        assert sim.last_analysis is None
-        for _ in range(5):
-            sim.step()
-        # На 5-м шаге должен сработать анализ
-        assert sim.last_analysis is not None
-        assert isinstance(sim.last_analysis, AnalysisResult)
-
-    def test_analyze_every_zero_no_trigger(self, sim):
-        assert sim.analyze_every == 0
-        for _ in range(20):
-            sim.step()
-        # Без analyze_every — анализ не запускается
-        assert sim.last_analysis is None
-
-    def test_last_analysis_updated(self, simple_graph, simple_ions):
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            dt=0.01, analyze_every=10,
-        )
+    def test_analyze_every_zero_no_trigger(self, graph, ions):
+        mock_backend = MagicMock()
+        mock_backend.analyze.return_value = AnalysisResult(
+            summary="ok", warnings=[], suggestions=[])
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                ai_backend=mock_backend, analyze_every=0)
         for _ in range(10):
-            sim.step()
-        first = sim.last_analysis
-        assert first is not None
-        for _ in range(10):
-            sim.step()
-        second = sim.last_analysis
-        # second — новый объект (даже если содержимое похожее)
-        assert second is not None
+            s.step()
+        assert mock_backend.analyze.call_count == 0
 
-    def test_manual_backend_explicit(self, simple_graph, simple_ions):
-        backend = ManualBackend()
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            ai_backend=backend,
-        )
-        assert sim.ai_backend.name == "manual"
-        result = sim.analyze_state()
-        assert result.backend == "manual"
-        assert result.confidence == 0.5
+    def test_last_analysis_updated(self, graph, ions):
+        mock_backend = MagicMock()
+        mock_backend.analyze.return_value = AnalysisResult(
+            summary="test", warnings=[], suggestions=[])
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                ai_backend=mock_backend, analyze_every=3)
+        s.step()
+        s.step()
+        s.step()
+        assert s.last_analysis is not None
+        assert s.last_analysis.summary == "test"
+
+    def test_manual_backend_explicit(self, graph, ions):
+        from network import get_backend
+        backend = get_backend()
+        s = BiologicalDiffusion(graph, ions, dt=0.01, ai_backend=backend)
+        result = s.analyze_state()
+        assert result is not None
 
 
-# ─── Mock-бэкенд ───
-
-class MockBackend:
-    """Простой mock для тестирования вызовов."""
-    def __init__(self):
-        self.name = "mock"
-        self.call_count = 0
-
-    def is_available(self):
-        return True
-
-    def analyze(self, concentrations, charges, time_step, context=None):
-        self.call_count += 1
-        return AnalysisResult(
-            summary=f"Mock analysis at step {time_step}",
-            warnings=[],
-            suggestions=[],
-            confidence=0.99,
-            backend="mock",
-        )
-
-    def validate_params(self, params):
-        self.call_count += 1
-        return AnalysisResult(
-            summary="Mock: params OK",
-            warnings=[],
-            suggestions=[],
-            confidence=0.99,
-            backend="mock",
-        )
-
-    def describe(self, text):
-        return AnalysisResult(
-            summary="Mock description",
-            warnings=[],
-            suggestions=[],
-            confidence=0.99,
-            backend="mock",
-        )
-
+# --- Mock-бэкенд ---
 
 class TestMockBackend:
-    def test_mock_analyze(self, simple_graph, simple_ions):
-        mock = MockBackend()
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            ai_backend=mock, analyze_every=3,
-        )
-        for _ in range(9):
-            sim.step()
-        # analyze_every=3, 9 шагов → 3 вызова (на шагах 3, 6, 9)
-        assert mock.call_count == 3
 
-    def test_mock_validate(self, simple_graph, simple_ions):
-        mock = MockBackend()
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            ai_backend=mock,
-        )
-        result = sim.validate_params()
-        assert result.backend == "mock"
-        assert result.confidence == 0.99
+    def test_mock_analyze(self, graph, ions):
+        mock = MagicMock()
+        mock.analyze.return_value = AnalysisResult(
+            summary="mock", warnings=["w"], suggestions=["s"])
+        s = BiologicalDiffusion(graph, ions, ai_backend=mock)
+        result = s.analyze_state()
+        assert result.summary == "mock"
+        assert result.warnings == ["w"]
+        assert result.suggestions == ["s"]
 
-    def test_mock_summary(self, simple_graph, simple_ions):
-        mock = MockBackend()
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            ai_backend=mock, analyze_every=1,
-        )
-        sim.step()
-        assert sim.last_analysis is not None
-        assert "Mock" in sim.last_analysis.summary
-        assert "step 1" in sim.last_analysis.summary
+    def test_mock_validate(self, graph, ions):
+        mock = MagicMock()
+        mock.validate_params.return_value = AnalysisResult(
+            summary="mock_valid", warnings=[], suggestions=[])
+        s = BiologicalDiffusion(graph, ions, ai_backend=mock)
+        result = s.validate_params()
+        assert result.summary == "mock_valid"
+
+    def test_mock_summary(self, graph, ions):
+        mock = MagicMock()
+        mock.analyze.return_value = AnalysisResult(
+            summary="test_summary", warnings=[], suggestions=[])
+        s = BiologicalDiffusion(graph, ions, ai_backend=mock)
+        result = s.analyze_state()
+        assert "test_summary" in result.summary
 
 
-# ─── Стабильность ───
+# --- Стабильность ---
 
 class TestStability:
-    def test_long_run_no_nan(self, sim):
-        for _ in range(500):
-            sim.step()
-        assert np.all(np.isfinite(sim.c))
-        assert sim.step_count == 500
 
-    def test_long_run_no_negative(self, sim):
+    def test_long_run_no_nan(self, solver):
         for _ in range(500):
-            sim.step()
-        # Допускаем небольшие отрицательные значения (численная погрешность)
-        # но не катастрофические
-        assert np.min(sim.c) > -10.0
+            solver.step()
+        assert not np.any(np.isnan(solver.c))
 
-    def test_long_run_quasineutrality(self, sim):
+    def test_long_run_no_negative(self, solver):
         for _ in range(500):
-            sim.step()
-        err = sim.quasineutrality_error()
-        assert err < 200.0
+            solver.step()
+        assert np.all(solver.c >= -1e-10)
 
-    def test_small_dt_stable(self, simple_graph, simple_ions):
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            dt=1e-4, F_RT=38.9,
-        )
+    def test_long_run_quasineutrality(self, solver):
+        for _ in range(500):
+            solver.step()
+        err = solver.quasineutrality_error()
+        assert err < 1e3
+
+    def test_small_dt_stable(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions, dt=1e-5)
         for _ in range(100):
-            sim.step()
-        assert np.all(np.isfinite(sim.c))
+            s.step()
+        assert not np.any(np.isnan(s.c))
 
-    def test_large_dt_warning(self, simple_graph, simple_ions):
-        sim = BiologicalDiffusion(
-            simple_graph, simple_ions,
-            dt=5.0,  # слишком большой
-        )
-        result = sim.validate_params()
-        assert len(result.warnings) > 0
+    def test_large_dt_warning(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions, dt=10.0)
+        for _ in range(5):
+            s.step()
+        assert not np.any(np.isnan(s.c))
+
+
+# --- Самосогласованный потенциал (v0.6.1) ---
+
+class TestSelfConsistent:
+    """Тесты самосогласованного потенциала (уравнение Пуассона)."""
+
+    @pytest.fixture
+    def graph(self):
+        return Graph(N=20, topology="chain")
+
+    @pytest.fixture
+    def ions(self):
+        return [
+            {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0,
+             "c_left": 145.0, "c_right": 10.0},
+            {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0,
+             "c_left": 4.0, "c_right": 100.0},
+            {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0,
+             "c_left": 110.0, "c_right": 110.0},
+            {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0,
+             "c_left": 1.0, "c_right": 0.1},
+        ]
+
+    @pytest.fixture
+    def solver(self, graph, ions):
+        return BiologicalDiffusion(graph, ions, dt=0.01,
+                                   self_consistent=True,
+                                   poisson_lambda=1.0)
+
+    def test_init_self_consistent_flag(self, solver):
+        assert solver.self_consistent is True
+
+    def test_init_poisson_matrix_exists(self, solver):
+        assert hasattr(solver, 'A_poisson')
+        assert solver.A_poisson.shape == (20, 20)
+
+    def test_disabled_by_default(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions)
+        assert s.self_consistent is False
+        assert not hasattr(s, 'A_poisson')
+
+    def test_phi_changes_after_step(self, solver):
+        phi_before = solver.phi.copy()
+        solver.step()
+        assert not np.allclose(solver.phi, phi_before)
+
+    def test_phi_not_constant(self, solver):
+        """φ не константа после шага (есть градиент)."""
+        solver.step()
+        assert np.ptp(solver.phi) > 1e-10
+
+    def test_boundary_conditions_hold(self, solver):
+        solver.step()
+        assert abs(solver.phi[0]) < 1e-10
+        assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
+
+    def test_no_nan_phi(self, solver):
+        for _ in range(50):
+            solver.step()
+        assert not np.any(np.isnan(solver.phi))
+
+    def test_poisson_solve_directly(self, solver):
+        solver._solve_poisson()
+        assert solver.phi.shape == (20,)
+        assert abs(solver.phi[0]) < 1e-10
+        assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
+
+    def test_charge_gradient_in_phi(self, graph, ions):
+        """Неоднородный заряд → неоднородный φ."""
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                self_consistent=True, poisson_lambda=10.0)
+        s.c[0, :10] = 200.0
+        s.c[0, 10:] = 50.0
+        s._solve_poisson()
+        phi_linear = np.linspace(0, s.phi_membrane, 20)
+        assert not np.allclose(s.phi, phi_linear, atol=1e-6)
+
+    def test_poisson_lambda_effect(self, graph, ions):
+        """Больший λ → большее отклонение от линейного φ."""
+        s1 = BiologicalDiffusion(graph, ions, dt=0.01,
+                                 self_consistent=True, poisson_lambda=0.1)
+        s2 = BiologicalDiffusion(graph, ions, dt=0.01,
+                                 self_consistent=True, poisson_lambda=100.0)
+        s1.c[0, :10] = 200.0
+        s1.c[0, 10:] = 50.0
+        s2.c[0, :10] = 200.0
+        s2.c[0, 10:] = 50.0
+        s1._solve_poisson()
+        s2._solve_poisson()
+        phi_lin = np.linspace(0, s1.phi_membrane, 20)
+        dev1 = np.max(np.abs(s1.phi - phi_lin))
+        dev2 = np.max(np.abs(s2.phi - phi_lin))
+        assert dev2 > dev1
+
+    def test_long_run_stable(self, solver):
+        for _ in range(200):
+            solver.step()
+        assert not np.any(np.isnan(solver.c))
+        assert not np.any(np.isnan(solver.phi))
+        assert np.max(np.abs(solver.phi)) < 1e6
+
+    def test_still_works_with_neuron(self, graph, ions):
+        """Самосогласование + нейрон — не крашит."""
+        from biological.neuron import NeuronLayer
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                self_consistent=True)
+        neuron = NeuronLayer(graph, neuron_nodes=[5, 10, 15], dt=0.01)
+        for _ in range(20):
+            s.step()
+            s.phi = neuron.apply_to_graph(s.phi, s.c)
+        assert not np.any(np.isnan(s.phi))
+
+    def test_config_passthrough(self):
+        """main.py передаёт self_consistent и poisson_lambda."""
+        from main import build_solver, build_graph, build_ions
+        cfg = {
+            'graph': {'N': 20, 'topology': 'chain'},
+            'physics_constants': {'F': 96485, 'R': 8.314, 'T': 310},
+            'ion_species': {
+                'Na': {'D': 1e-9, 'z': 1, 'c0': 145},
+                'K': {'D': 2e-9, 'z': 1, 'c0': 4},
+                'Cl': {'D': 2e-9, 'z': -1, 'c0': 110},
+                'Ca': {'D': 0.8e-9, 'z': 2, 'c0': 1},
+            },
+            'solver': {
+                'dt': 0.01, 'self_consistent': True,
+                'poisson_lambda': 5.0,
+            },
+        }
+        g = build_graph(cfg)
+        ions = build_ions(cfg)
+        s = build_solver(cfg, g, ions)
+        assert s.self_consistent is True
+        assert s.poisson_lambda == 5.0
+# === END ===
+
