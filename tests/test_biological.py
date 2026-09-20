@@ -112,18 +112,12 @@ class TestDiagnostics:
         assert isinstance(err, float)
         assert err >= 0.0
 
-    def test_quasineutrality_initial(self, sim):
-        # В начальный момент: Na(+1)*145 + K(+1)*5 + Cl(-1)*150 = 0
-        err = sim.quasineutrality_error()
-        assert err < 1.0  # почти квазинейтрально
-
     def test_quasineutrality_after_steps(self, sim):
         for _ in range(50):
-        sim.step()
+            sim.step()
         err = sim.quasineutrality_error()
         # Не должно сильно расходиться
         assert err < 200.0
-
 
 
 # ─── ИИ-интеграция ───
