@@ -68,6 +68,8 @@ def build_solver(cfg, graph, ions):
         picard_tol=solver_cfg.get('picard_tol', 1e-6),
         picard_max_iter=solver_cfg.get('picard_max_iter', 20),
         analyze_every=solver_cfg.get('analyze_every', 0),
+        self_consistent=solver_cfg.get('self_consistent', False),
+        poisson_lambda=solver_cfg.get('poisson_lambda', 1.0),
     )
 
 
@@ -113,6 +115,7 @@ def run_simulation(cfg, n_steps=None, output_every=None):
     if neuron:
         print(f"    Узлы: {list(neuron.neuron_indices)}")
         print(f"    Нернст: {'да' if neuron.use_nernst else 'нет'}")
+    print(f"  Самосогласование: {'да' if solver.self_consistent else 'нет'}")
     print(f"  Шагов: {n_steps}")
     print(f"  dt: {solver.dt}")
     print()
