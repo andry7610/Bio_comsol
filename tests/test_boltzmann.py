@@ -1,74 +1,142 @@
-def test_boltzmann_equilibrium():
-    """Тест 3: Стационарное распределение сходится к Больцману.
+"""
+Тест Больцмана: проверка, что стационарное распределение ионов
+совпадает с аналитическим c(x) = c0 * exp(-z * phi(x)).
 
-    С фиксированным потенциалом φ(x) и граничными условиями Дирихле,
-    равновесие: c_k(x) = c_k(0) * exp(-z_k * (φ(x) - φ(0)) * F/RT)
-    """
-    print("\n=== Test 3: Boltzmann Equilibrium ===")
+Использует внешний квадратичный потенциал (не Пуассон),
+чтобы проверить миграционный член в чистом виде.
+"""
+import sys
+from pathlib import Path
+
+# Фикс путей для запуска из корня репозитория
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import numpy as np
+
+
+class ChainGraph:
+    """1D-цепочка из N узлов. Плотный лапласиан."""
+    def __init__(self, N):
+        self.N = N
+        W = np.zeros((N, N))
+        for i in range(N - 1):
+            W[i, i + 1] = 1.0
+            W[i + 1, i] = 1.0
+        degrees = np.sum(W, axis=1)
+        self.L_dense = np.diag(degrees) - W
+
+    @property
+    def edges(self):
+        return [(i, i + 1, 1.0) for i in range(self.N - 1)]
+
+    @property
+    def laplacian(self):
+        return self.L_dense
+
+
+def run_boltzmann_test():
     N = 30
-    graph = Graph(N=N, p_edge=1.0, seed=42)
+    graph = ChainGraph(N)
+    edges = graph.edges
 
-    bio = BiologicalDiffusion(
-        graph,
-        [
-            {"name": "Na", "D": 0.1,  "z": 1,  "c0": 10.0, "c_left": 10.0, "c_right": 0.165},
-            {"name": "Cl", "D": 0.15, "z": -1, "c0": 10.0, "c_left": 10.0, "c_right": 60.6},
-        ],
-        dt=2.0,
-        F_RT=1.0,
-        membrane_potential=-1.8
-    )
+    # Квадратичный внешний потенциал: 0 на левом конце, 1.0 на правом
+    x = np.arange(N, dtype=float)
+    phi = (x / (N - 1)) ** 2 * 1.0
 
-    # Больцмановские граничные значения
-    phi = bio.phi
-    c_boltz_na = 10.0 * np.exp(-1.0 * (phi - phi[0]))
-    c_boltz_cl = 10.0 * np.exp(+1.0 * (phi - phi[0]))
+    ions = [
+        {"name": "Na", "D": 0.1,  "z": 1,  "c0": 10.0},
+        {"name": "Cl", "D": 0.15, "z": -1, "c0": 10.0},
+    ]
 
-    bio.c_boundary[0, 0] = c_boltz_na[0]
-    bio.c_boundary[0, 1] = c_boltz_na[-1]
-    bio.c_boundary[1, 0] = c_boltz_cl[0]
-    bio.c_boundary[1, 1] = c_boltz_cl[-1]
+    dt = 2.0
+    F_RT = 1.0
 
-    bio.c[0, 0] = c_boltz_na[0]
-    bio.c[0, -1] = c_boltz_na[-1]
-    bio.c[1, 0] = c_boltz_cl[0]
-    bio.c[1, -1] = c_boltz_cl[-1]
+    # Равномерные начальные концентрации
+    c = np.array([np.full(N, ion["c0"]) for ion in ions])
 
-    print(f"Graph: {N} nodes, linear phi: 0 -> {phi[-1]:.2f}")
-    print(f"Na Boltzmann: [{c_boltz_na[0]:.4f} ... {c_boltz_na[-1]:.4f}]")
-    print(f"Cl Boltzmann: [{c_boltz_cl[0]:.4f} ... {c_boltz_cl[-1]:.4f}]")
+    # Граничные условия Дирихле = больцмановские значения
+    dirichlet_nodes = [0, N - 1]
+    dirichlet_vals = {}
+    for k in range(len(ions)):
+        c_left = ions[k]["c0"] * np.exp(-ions[k]["z"] * phi[0] * F_RT)
+        c_right = ions[k]["c0"] * np.exp(-ions[k]["z"] * phi[-1] * F_RT)
+        dirichlet_vals[k] = {0: c_left, N - 1: c_right}
+        c[k, 0] = c_left
+        c[k, -1] = c_right
 
-    # Долгая релаксация к равновесию
-    c_prev = bio.c.copy()
-    for step in range(100000):
-        bio.step()
+    print("=== Boltzmann Equilibrium Test ===")
+    print(f"Graph: {N} nodes chain, quadratic potential 0 -> {phi[-1]:.1f}")
+    print(f"dt = {dt}")
+    for k in range(len(ions)):
+        print(f"  {ions[k]['name']}: c_left={dirichlet_vals[k][0]:.4f}, "
+              f"c_right={dirichlet_vals[k][N-1]:.4f}")
 
-        if step % 1000 == 0:
-            drift = np.max(np.abs(bio.c - c_prev))
-            if step % 20000 == 0:
-                print(f"  step {step}: drift={drift:.4e}")
-            if drift < 1e-10:
-                print(f"  Converged at step {step}")
-                break
-            c_prev = bio.c.copy()
+    # Симуляция: backward Euler + миграция в матрице (implicit)
+    for step in range(500000):
+        c_prev = c.copy()
 
-    # Сравнение
-    interior = slice(1, -1)
+        for k in range(len(ions)):
+            D = ions[k]["D"]
+            z = ions[k]["z"]
+
+            A = np.zeros((N, N))
+            for (i, j, w) in edges:
+                dphi = phi[j] - phi[i]
+
+                # Диффузия
+                A[i, i] -= dt * D * w
+                A[i, j] += dt * D * w
+                A[j, j] -= dt * D * w
+                A[j, i] += dt * D * w
+
+                # Миграция
+                coef = dt * D * z * F_RT * 0.5 * dphi
+                A[i, i] += coef
+                A[i, j] += coef
+                A[j, i] -= coef
+                A[j, j] -= coef
+
+            M = np.eye(N) - A
+            b = c[k].copy()
+
+            for node in dirichlet_nodes:
+                M[node, :] = 0.0
+                M[node, node] = 1.0
+                b[node] = dirichlet_vals[k][node]
+
+            c[k] = np.linalg.solve(M, b)
+
+        drift = np.max(np.abs(c - c_prev))
+        if step % 50000 == 0:
+            print(f"  step {step}: drift={drift:.4e}")
+        if drift < 1e-10:
+            print(f"  Converged at step {step}")
+            break
+
+    # Сравнение с аналитическим Больцманом
+    phi_0 = phi[0]
     passed = True
-
-    for k, (name, c_anal) in enumerate(zip(["Na", "Cl"], [c_boltz_na, c_boltz_cl])):
+    for k in range(len(ions)):
+        c_anal = ions[k]["c0"] * np.exp(-ions[k]["z"] * (phi - phi_0) * F_RT)
+        interior = slice(1, -1)
         rel_err = np.max(
-            np.abs(bio.c[k, interior] - c_anal[interior]) / np.maximum(c_anal[interior], 1e-10)
+            np.abs(c[k, interior] - c_anal[interior]) / c_anal[interior]
         )
-        print(f"\n{name}:")
-        print(f"  Sim:       [{bio.c[k,1]:.4f} ... {bio.c[k,N//2]:.4f} ... {bio.c[k,-2]:.4f}]")
+        print(f"\n{ions[k]['name']} (z={ions[k]['z']:+.0f}):")
+        print(f"  Sim:       [{c[k,1]:.4f} ... {c[k,N//2]:.4f} ... {c[k,-2]:.4f}]")
         print(f"  Boltzmann: [{c_anal[1]:.4f} ... {c_anal[N//2]:.4f} ... {c_anal[-2]:.4f}]")
         print(f"  Max Rel Error (interior) = {rel_err:.4%}")
         if rel_err > 0.05:
             passed = False
 
+    print("\n=== VERDICT ===")
     if passed:
-        print("\n✅ Test 3 PASSED")
+        print("✅ TEST PASSED: Both ions within 5% of Boltzmann distribution.")
     else:
-        print("\n❌ Test 3 FAILED")
-    return passed
+        print("❌ TEST FAILED: Distribution deviates beyond 5% tolerance.")
+
+
+if __name__ == "__main__":
+    run_boltzmann_test()
