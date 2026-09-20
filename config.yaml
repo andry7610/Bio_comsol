@@ -1,5 +1,5 @@
 # config.yaml — Физические константы и параметры модели
-# GAK-001 Bio-Diffusion v0.6
+# GAK-001 Bio-Diffusion v0.6.1
 
 physics_constants:
   T: 310.0          # K
@@ -45,6 +45,8 @@ solver:
   picard_max_iter: 20
   steady_state_tol: 1.0e-10
   analyze_every: 0            # 0 = ИИ-анализ выключен
+  self_consistent: false      # true = φ из уравнения Пуассона
+  poisson_lambda: 1.0         # коэффициент связи L·φ = -λ·ρ
 
 neuron:
   enabled: true
@@ -66,3 +68,4 @@ neuron:
 simulation:
   n_steps: 100
   output_every: 10
+# === END ===
