@@ -1,35 +1,35 @@
 # config.yaml — Физические константы и параметры модели
-# GAK-001 Bio-Diffusion v0.6.1
+# GAK-001 Bio-Diffusion v0.7
 
 physics_constants:
-  T: 310.0          # K
-  kB: 1.380649e-23  # Дж/К
-  e: 1.602176634e-19  # Кл
-  NA: 6.02214076e23    # 1/моль
-  R: 8.314462618       # Дж/(моль·К)
-  F: 96485.33212       # Кл/моль
-  eps0: 8.8541878128e-12  # Ф/м
-  RT: 2578.48        # Дж/моль = R * T
-  F_RT: 37.44        # 1/В = F / (R * T)
-  thermal_voltage: 0.02569  # В = RT / F
+  T: 310.0
+  kB: 1.380649e-23
+  e: 1.602176634e-19
+  NA: 6.02214076e23
+  R: 8.314462618
+  F: 96485.33212
+  eps0: 8.8541878128e-12
+  RT: 2578.48
+  F_RT: 37.44
+  thermal_voltage: 0.02569
 
 ion_species:
   Na:
-    D: 1.33e-9      # м²/с
+    D: 1.33e-9
     z: 1
-    c0: 145.0        # мМ
+    c0: 145.0
   K:
-    D: 1.96e-9      # м²/с
+    D: 1.96e-9
     z: 1
-    c0: 4.0          # мМ
+    c0: 4.0
   Cl:
-    D: 2.03e-9      # м²/с
+    D: 2.03e-9
     z: -1
-    c0: 110.0        # мМ
+    c0: 110.0
   Ca:
-    D: 0.79e-9      # м²/с
+    D: 0.79e-9
     z: 2
-    c0: 1.0          # мМ
+    c0: 1.0
 
 graph:
   N: 20
@@ -38,21 +38,24 @@ graph:
   cross_section: 1.0e-8
 
 solver:
-  dt: 0.01          # с
-  membrane_potential: -1.8    # В (на мембране)
+  dt: 0.01
+  membrane_potential: -1.8
   eps_relative: 1.0
   picard_tol: 1.0e-6
   picard_max_iter: 20
   steady_state_tol: 1.0e-10
-  analyze_every: 0            # 0 = ИИ-анализ выключен
-  self_consistent: false      # true = φ из уравнения Пуассона
-  poisson_lambda: 1.0         # коэффициент связи L·φ = -λ·ρ
+  analyze_every: 0
+  self_consistent: false
+  poisson_lambda: 1.0
+  use_newton: false
+  newton_tol: 1.0e-8
+  newton_max_iter: 5
 
 neuron:
   enabled: true
   neuron_nodes: [5, 10, 15]
   dt: 0.01
-  use_nernst: false           # true = E_Na/E_K из концентраций
+  use_nernst: false
   g_Na: 120.0
   g_K: 36.0
   g_L: 0.3
