@@ -27,6 +27,20 @@ def ions():
 
 
 @pytest.fixture
+def ions_grad():
+    return [
+        {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0,
+         "c_left": 145.0, "c_right": 10.0},
+        {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0,
+         "c_left": 4.0, "c_right": 100.0},
+        {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0,
+         "c_left": 110.0, "c_right": 110.0},
+        {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0,
+         "c_left": 1.0, "c_right": 0.1},
+    ]
+
+
+@pytest.fixture
 def solver(graph, ions):
     return BiologicalDiffusion(graph, ions, dt=0.01)
 
@@ -73,18 +87,7 @@ class TestBasicSimulation:
         assert solver.phi[0] == 0.0
         assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
 
-    def test_concentration_changes_over_time(self, graph):
-        """Неоднородные границы → концентрации меняются."""
-        ions_grad = [
-            {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0,
-             "c_left": 145.0, "c_right": 10.0},
-            {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0,
-             "c_left": 4.0, "c_right": 100.0},
-            {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0,
-             "c_left": 110.0, "c_right": 110.0},
-            {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0,
-             "c_left": 1.0, "c_right": 0.1},
-        ]
+    def test_concentration_changes_over_time(self, graph, ions_grad):
         s = BiologicalDiffusion(graph, ions_grad, dt=0.01)
         c_before = s.c.copy()
         s.step()
@@ -102,7 +105,6 @@ class TestDiagnostics:
     def test_total_charge(self, solver):
         charge = solver.total_charge()
         assert isinstance(charge, float)
-        # Na + K - Cl + 2*Ca = 145 + 4 - 110 + 2 = 41
         assert abs(charge - 41 * 20) < 1e-6
 
     def test_charge_per_node_shape(self, solver):
@@ -311,7 +313,6 @@ class TestSelfConsistent:
         assert not np.allclose(solver.phi, phi_before)
 
     def test_phi_not_constant(self, solver):
-        """φ не константа после шага (есть градиент)."""
         solver.step()
         assert np.ptp(solver.phi) > 1e-10
 
@@ -332,7 +333,6 @@ class TestSelfConsistent:
         assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
 
     def test_charge_gradient_in_phi(self, graph, ions):
-        """Неоднородный заряд → неоднородный φ."""
         s = BiologicalDiffusion(graph, ions, dt=0.01,
                                 self_consistent=True, poisson_lambda=10.0)
         s.c[0, :10] = 200.0
@@ -342,7 +342,6 @@ class TestSelfConsistent:
         assert not np.allclose(s.phi, phi_linear, atol=1e-6)
 
     def test_poisson_lambda_effect(self, graph, ions):
-        """Больший λ → большее отклонение от линейного φ."""
         s1 = BiologicalDiffusion(graph, ions, dt=0.01,
                                  self_consistent=True, poisson_lambda=0.1)
         s2 = BiologicalDiffusion(graph, ions, dt=0.01,
@@ -366,7 +365,6 @@ class TestSelfConsistent:
         assert np.max(np.abs(solver.phi)) < 1e6
 
     def test_still_works_with_neuron(self, graph, ions):
-        """Самосогласование + нейрон — не крашит."""
         from biological.neuron import NeuronLayer
         s = BiologicalDiffusion(graph, ions, dt=0.01,
                                 self_consistent=True)
@@ -377,7 +375,6 @@ class TestSelfConsistent:
         assert not np.any(np.isnan(s.phi))
 
     def test_config_passthrough(self):
-        """main.py передаёт self_consistent и poisson_lambda."""
         from main import build_solver, build_graph, build_ions
         cfg = {
             'graph': {'N': 20, 'topology': 'chain'},
@@ -398,4 +395,126 @@ class TestSelfConsistent:
         s = build_solver(cfg, g, ions)
         assert s.self_consistent is True
         assert s.poisson_lambda == 5.0
+
+
+# --- Метод Ньютона (v0.7) ---
+
+class TestNewton:
+    """Тесты метода Ньютона с аналитическим якобианом."""
+
+    @pytest.fixture
+    def graph(self):
+        return Graph(N=20, topology="chain")
+
+    @pytest.fixture
+    def ions(self):
+        return [
+            {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0,
+             "c_left": 145.0, "c_right": 10.0},
+            {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0,
+             "c_left": 4.0, "c_right": 100.0},
+            {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0,
+             "c_left": 110.0, "c_right": 110.0},
+            {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0,
+             "c_left": 1.0, "c_right": 0.1},
+        ]
+
+    @pytest.fixture
+    def solver_newton(self, graph, ions):
+        return BiologicalDiffusion(graph, ions, dt=0.01,
+                                   use_newton=True)
+
+    @pytest.fixture
+    def solver_picard(self, graph, ions):
+        return BiologicalDiffusion(graph, ions, dt=0.01,
+                                   use_newton=False)
+
+    def test_newton_flag(self, solver_newton):
+        assert solver_newton.use_newton is True
+
+    def test_newton_disabled_by_default(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions)
+        assert s.use_newton is False
+
+    def test_newton_step_returns_iters(self, solver_newton):
+        iters = solver_newton.step()
+        assert isinstance(iters, int)
+        assert iters >= 1
+        assert iters <= solver_newton.newton_max_iter
+
+    def test_newton_fewer_iters_than_picard(self, solver_newton, solver_picard):
+        """Ньютон сходится за fewer итераций, чем Пикар."""
+        solver_newton.step()
+        solver_picard.step()
+        assert solver_newton.last_newton_iters <= solver_picard.last_picard_iters
+
+    def test_newton_converges_one_step(self, solver_newton):
+        """При фиксированном φ система линейна → 1 итерация."""
+        solver_newton.step()
+        assert solver_newton.last_newton_iters == 1
+
+    def test_newton_boundary_conditions(self, graph, ions):
+        s = BiologicalDiffusion(graph, ions, dt=0.01, use_newton=True)
+        s.step()
+        assert abs(s.c[0, 0] - 145.0) < 1e-10
+        assert abs(s.c[0, -1] - 10.0) < 1e-10
+
+    def test_newton_no_nan(self, solver_newton):
+        for _ in range(100):
+            solver_newton.step()
+        assert not np.any(np.isnan(solver_newton.c))
+
+    def test_newton_no_negative(self, solver_newton):
+        for _ in range(100):
+            solver_newton.step()
+        assert np.all(solver_newton.c >= -1e-10)
+
+    def test_newton_same_result_as_picard(self, solver_newton, solver_picard):
+        """Результат Ньютона близок к Пикару после 10 шагов."""
+        for _ in range(10):
+            solver_newton.step()
+            solver_picard.step()
+        assert np.allclose(solver_newton.c, solver_picard.c, atol=1e-3)
+
+    def test_newton_with_self_consistent(self, graph, ions):
+        """Ньютон + самосогласование — стабильно."""
+        s = BiologicalDiffusion(graph, ions, dt=0.01,
+                                use_newton=True, self_consistent=True,
+                                poisson_lambda=1.0)
+        for _ in range(50):
+            s.step()
+        assert not np.any(np.isnan(s.c))
+        assert not np.any(np.isnan(s.phi))
+        assert abs(s.phi[0]) < 1e-10
+        assert abs(s.phi[-1] - s.phi_membrane) < 1e-10
+
+    def test_newton_long_run_stable(self, solver_newton):
+        for _ in range(500):
+            solver_newton.step()
+        assert not np.any(np.isnan(solver_newton.c))
+        assert np.max(np.abs(solver_newton.c)) < 1e6
+
+    def test_newton_config_passthrough(self):
+        """main.py передаёт use_newton, newton_tol, newton_max_iter."""
+        from main import build_solver, build_graph, build_ions
+        cfg = {
+            'graph': {'N': 20, 'topology': 'chain'},
+            'physics_constants': {'F': 96485, 'R': 8.314, 'T': 310},
+            'ion_species': {
+                'Na': {'D': 1e-9, 'z': 1, 'c0': 145},
+                'K': {'D': 2e-9, 'z': 1, 'c0': 4},
+                'Cl': {'D': 2e-9, 'z': -1, 'c0': 110},
+                'Ca': {'D': 0.8e-9, 'z': 2, 'c0': 1},
+            },
+            'solver': {
+                'dt': 0.01, 'use_newton': True,
+                'newton_tol': 1e-10, 'newton_max_iter': 3,
+            },
+        }
+        g = build_graph(cfg)
+        ions = build_ions(cfg)
+        s = build_solver(cfg, g, ions)
+        assert s.use_newton is True
+        assert s.newton_tol == 1e-10
+        assert s.newton_max_iter == 3
 # === END ===
