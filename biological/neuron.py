@@ -1,26 +1,40 @@
 """biological/neuron.py — Активный нейро-слой на базе квазинейтральной модели.
 
 Реализует упрощённую модель Ходжкина-Хаксли (Na/K каналы) в выделенных узлах.
+Поддерживает динамический расчёт равновесных потенциалов по формуле Нернста.
 """
 
 import numpy as np
+
+# Физические константы для формулы Нернста
+R = 8.314        # Дж/(моль·К)
+T = 310.0        # К (37 °C)
+F = 96485.0      # Кл/моль
+RT_OVER_F = R * T / F * 1000.0  # мВ (~26.7 мВ при 310 К)
 
 
 class NeuronLayer:
     """Нейро-слой, накладываемый на граф Bio-COMSOL."""
 
-    def __init__(self, graph, neuron_nodes, dt=1e-3):
+    def __init__(self, graph, neuron_nodes, dt=1e-3,
+                 use_nernst=False, na_index=0, k_index=1):
         """
         Args:
             graph: объект Graph из network/graph.py
             neuron_nodes: список индексов узлов с активными нейронами
-            dt: шаг по времени (должен совпадать с основным солвером)
+            dt: шаг по времени
+            use_nernst: если True — E_Na/E_K считаются из концентраций
+            na_index: индекс Na в массиве ионов солвера
+            k_index: индекс K в массиве ионов солвера
         """
         self.N = graph.N
         self.neuron_indices = np.array(neuron_nodes)
         self.dt = dt
+        self.use_nernst = use_nernst
+        self.na_index = na_index
+        self.k_index = k_index
 
-        # Параметры каналов
+        # Параметры каналов (статический fallback)
         self.g_Na = 120.0
         self.E_Na = 50.0
         self.g_K = 36.0
@@ -34,6 +48,10 @@ class NeuronLayer:
         self.n = np.full(len(neuron_nodes), 0.32)
 
         self.last_current = np.zeros(len(neuron_nodes))
+
+        # Последние динамические потенциалы Нернста
+        self.E_Na_dynamic = None
+        self.E_K_dynamic = None
 
     @staticmethod
     def _alpha_m(V):
@@ -65,53 +83,4 @@ class NeuronLayer:
 
     def update_gates(self, V_neurons):
         """Обновляет переменные ворот (m, h, n) для всех нейронов."""
-        for idx, V in enumerate(V_neurons):
-            am = self._alpha_m(V)
-            bm = self._beta_m(V)
-            ah = self._alpha_h(V)
-            bh = self._beta_h(V)
-            an = self._alpha_n(V)
-            bn = self._beta_n(V)
 
-            tau_m = 1.0 / (am + bm)
-            tau_h = 1.0 / (ah + bh)
-            tau_n = 1.0 / (an + bn)
-
-            m_inf = am / (am + bm)
-            h_inf = ah / (ah + bh)
-            n_inf = an / (an + bn)
-
-            self.m[idx] = m_inf + (self.m[idx] - m_inf) * np.exp(-self.dt / tau_m)
-            self.h[idx] = h_inf + (self.h[idx] - h_inf) * np.exp(-self.dt / tau_h)
-            self.n[idx] = n_inf + (self.n[idx] - n_inf) * np.exp(-self.dt / tau_n)
-
-    def compute_current(self, V_neurons, c_ions, z_ions):
-        """Считает мембранный ток I_ion для нейронов."""
-        I_Na = self.g_Na * (self.m ** 3) * self.h * (V_neurons - self.E_Na)
-        I_K = self.g_K * (self.n ** 4) * (V_neurons - self.E_K)
-        I_L = self.g_L * (V_neurons - self.E_L)
-
-        I_total = I_Na + I_K + I_L
-        self.last_current = I_total
-        return I_total
-
-    def apply_to_graph(self, phi_global, c_global):
-        """Обновляет глобальный потенциал phi на основе нейро-активности."""
-        if len(self.neuron_indices) == 0:
-            return phi_global
-
-        V_local = phi_global[self.neuron_indices]
-
-        self.update_gates(V_local)
-
-        I = self.compute_current(V_local, c_global, np.array([1, 1, -1, 2]))
-
-        C_m = 1.0
-        dV = -I * self.dt / C_m
-        V_new = V_local + dV
-        V_new = np.clip(V_new, -90.0, 60.0)
-
-        phi_updated = phi_global.copy()
-        phi_updated[self.neuron_indices] = V_new
-
-        return phi_updated
