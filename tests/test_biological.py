@@ -73,10 +73,22 @@ class TestBasicSimulation:
         assert solver.phi[0] == 0.0
         assert abs(solver.phi[-1] - solver.phi_membrane) < 1e-10
 
-    def test_concentration_changes_over_time(self, solver):
-        c_before = solver.c.copy()
-        solver.step()
-        assert not np.allclose(solver.c, c_before)
+    def test_concentration_changes_over_time(self, graph):
+        """Неоднородные границы → концентрации меняются."""
+        ions_grad = [
+            {"name": "Na", "D": 1.33e-9, "z": 1, "c0": 145.0,
+             "c_left": 145.0, "c_right": 10.0},
+            {"name": "K", "D": 1.96e-9, "z": 1, "c0": 4.0,
+             "c_left": 4.0, "c_right": 100.0},
+            {"name": "Cl", "D": 2.03e-9, "z": -1, "c0": 110.0,
+             "c_left": 110.0, "c_right": 110.0},
+            {"name": "Ca", "D": 0.79e-9, "z": 2, "c0": 1.0,
+             "c_left": 1.0, "c_right": 0.1},
+        ]
+        s = BiologicalDiffusion(graph, ions_grad, dt=0.01)
+        c_before = s.c.copy()
+        s.step()
+        assert not np.allclose(s.c, c_before)
 
     def test_picard_convergence(self, solver):
         solver.step()
@@ -146,7 +158,8 @@ class TestAIIntegration:
     def test_analyze_every_triggers(self, graph, ions):
         mock_backend = MagicMock()
         mock_backend.analyze.return_value = AnalysisResult(
-            summary="ok", warnings=[], suggestions=[])
+            summary="ok", warnings=[], suggestions=[],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, dt=0.01,
                                 ai_backend=mock_backend, analyze_every=5)
         for _ in range(10):
@@ -156,7 +169,8 @@ class TestAIIntegration:
     def test_analyze_every_zero_no_trigger(self, graph, ions):
         mock_backend = MagicMock()
         mock_backend.analyze.return_value = AnalysisResult(
-            summary="ok", warnings=[], suggestions=[])
+            summary="ok", warnings=[], suggestions=[],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, dt=0.01,
                                 ai_backend=mock_backend, analyze_every=0)
         for _ in range(10):
@@ -166,7 +180,8 @@ class TestAIIntegration:
     def test_last_analysis_updated(self, graph, ions):
         mock_backend = MagicMock()
         mock_backend.analyze.return_value = AnalysisResult(
-            summary="test", warnings=[], suggestions=[])
+            summary="test", warnings=[], suggestions=[],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, dt=0.01,
                                 ai_backend=mock_backend, analyze_every=3)
         s.step()
@@ -190,7 +205,8 @@ class TestMockBackend:
     def test_mock_analyze(self, graph, ions):
         mock = MagicMock()
         mock.analyze.return_value = AnalysisResult(
-            summary="mock", warnings=["w"], suggestions=["s"])
+            summary="mock", warnings=["w"], suggestions=["s"],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, ai_backend=mock)
         result = s.analyze_state()
         assert result.summary == "mock"
@@ -200,7 +216,8 @@ class TestMockBackend:
     def test_mock_validate(self, graph, ions):
         mock = MagicMock()
         mock.validate_params.return_value = AnalysisResult(
-            summary="mock_valid", warnings=[], suggestions=[])
+            summary="mock_valid", warnings=[], suggestions=[],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, ai_backend=mock)
         result = s.validate_params()
         assert result.summary == "mock_valid"
@@ -208,7 +225,8 @@ class TestMockBackend:
     def test_mock_summary(self, graph, ions):
         mock = MagicMock()
         mock.analyze.return_value = AnalysisResult(
-            summary="test_summary", warnings=[], suggestions=[])
+            summary="test_summary", warnings=[], suggestions=[],
+            confidence=1.0, backend="mock")
         s = BiologicalDiffusion(graph, ions, ai_backend=mock)
         result = s.analyze_state()
         assert "test_summary" in result.summary
@@ -381,4 +399,3 @@ class TestSelfConsistent:
         assert s.self_consistent is True
         assert s.poisson_lambda == 5.0
 # === END ===
-
