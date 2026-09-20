@@ -1,146 +1,150 @@
+"""biological/neuron.py — Активный нейро-слой на базе квазинейтральной модели.
+Версия: v0.2 (совместима с biological v0.5)
 
-"""
-network/neuron_analysis.py — ИИ-анализ нейро-слоя.
+Реализует:
+- Упрощённую модель Ходжкина-Хаксли (Na/K каналы) в выделенных узлах.
+- Расчёт мембранного тока и потенциала действия.
+- Обратную связь: обновлённый потенциал (phi) для основного солвера.
 
-Расширяет существующий network/ для анализа NeuronLayer.
-Использует тот же интерфейс AnalysisResult из base.py.
+Отличия от v0.1:
+  - Исправлен баг в update_gates: каждый нейрон использует свой индекс,
+    а не self.m[0] для всех.
 """
 
 import numpy as np
-from network.base import AnalysisResult
 
 
-def manual_neuron_analysis(neuron):
-    """Эвристический анализ нейро-слоя для ManualBackend.
-
-    Returns:
-        (summary, warnings, suggestions, confidence)
+class NeuronLayer:
     """
-    warnings = []
-    suggestions = []
-    n_neurons = len(neuron.neuron_indices)
+    Нейро-слой, который накладывается на граф Bio-COMSOL.
+    
+    Логика:
+    1. Основной солвер (BiologicalDiffusion) считает пассивный транспорт.
+    2. NeuronLayer берёт концентрации и потенциал, активирует каналы в узлах-нейронах.
+    3. Считает локальный потенциал действия.
+    4. Возвращает обновлённый phi для следующего шага солвера.
+    """
 
-    # --- Спайки ---
-    spikes = int(np.sum(np.abs(neuron.last_current) > 50.0)) if n_neurons > 0 else 0
-    max_current = float(np.max(np.abs(neuron.last_current))) if n_neurons > 0 else 0.0
+    def __init__(self, graph, neuron_nodes, dt=1e-3):
+        """
+        Args:
+            graph: объект Graph из network/graph.py
+            neuron_nodes: список индексов узлов, где есть активные нейроны (например, [10, 20, 30])
+            dt: шаг по времени (должен совпадать с основным солвером)
+        """
+        self.N = graph.N
+        self.neuron_indices = np.array(neuron_nodes, dtype=int)
+        self.dt = dt
+        
+        # Параметры каналов
+        self.g_Na = 120.0
+        self.E_Na = 50.0   # мВ
+        self.g_K = 36.0
+        self.E_K = -75.0
+        self.g_L = 0.3
+        self.E_L = -54.3
+        self.C_m = 1.0     # ёмкость мембраны
 
-    # --- Ворота ---
-    gate_issues = []
-    if n_neurons > 0:
-        if np.any(neuron.m < 0) or np.any(neuron.m > 1):
-            gate_issues.append("m")
-        if np.any(neuron.h < 0) or np.any(neuron.h > 1):
-            gate_issues.append("h")
-        if np.any(neuron.n < 0) or np.any(neuron.n > 1):
-            gate_issues.append("n")
+        # Переменные состояния для каждого нейрона (m, h, n)
+        n = len(neuron_nodes)
+        self.m = np.full(n, 0.05)   # активация Na
+        self.h = np.full(n, 0.6)    # инактивация Na
+        self.n = np.full(n, 0.32)   # активация K
 
-    for g in gate_issues:
-        warnings.append(f"Ворота {g} вышли за пределы [0, 1]")
+        # Для хранения последнего рассчитанного тока
+        self.last_current = np.zeros(n)
 
-    # --- Токи ---
-    if n_neurons > 0 and max_current > 500.0:
-        warnings.append(f"Аномально высокий ток: {max_current:.1f}")
-        suggestions.append("Уменьшите g_Na или dt")
+    @staticmethod
+    def _alpha_m(V):
+        if V == -40:
+            return 0.1
+        return 0.1 * (V + 40.0) / (1.0 - np.exp(-0.1 * (V + 40.0)))
 
-    # --- Спайки ---
-    if n_neurons > 0 and spikes == 0:
-        suggestions.append("Нет спайков — возможно, g_Na слишком мала или потенциал покоя слишком низкий")
-    elif spikes > 0:
-        suggestions.append(f"Обнаружено {spikes} активных нейронов — система возбудима")
+    @staticmethod
+    def _beta_m(V):
+        return 4.0 * np.exp(-(V + 65.0) / 18.0)
 
-    summary = f"Neurons: {n_neurons}, spikes: {spikes}, max |I|: {max_current:.2f}"
-    confidence = 0.7 if n_neurons > 0 else 0.5
+    @staticmethod
+    def _alpha_h(V):
+        return 0.07 * np.exp(-(V + 65.0) / 20.0)
 
-    return summary, warnings, suggestions, confidence
+    @staticmethod
+    def _beta_h(V):
+        return 1.0 / (1.0 + np.exp(-0.1 * (V + 35.0)))
 
+    @staticmethod
+    def _alpha_n(V):
+        if V == -55:
+            return 0.01
+        return 0.01 * (V + 55.0) / (1.0 - np.exp(-0.1 * (V + 55.0)))
 
-def manual_neuron_validation(params):
-    """Проверка параметров нейрона перед запуском."""
-    warnings = []
-    suggestions = []
+    @staticmethod
+    def _beta_n(V):
+        return 0.125 * np.exp(-(V + 65.0) / 80.0)
 
-    dt = params.get("dt", 1e-3)
-    if dt <= 0:
-        warnings.append("dt <= 0 — недопустимо")
-    if dt > 0.1:
-        warnings.append(f"dt={dt} слишком велик для HH-динамики")
-        suggestions.append("Используйте dt < 0.01 для устойчивости ворот")
+    def update_gates(self, V_neurons):
+        """Обновляет переменные ворот (m, h, n) для всех нейронов.
+        
+        v0.2: исправлен баг — каждый нейрон использует свой индекс,
+        а не self.m[0] для всех.
+        """
+        for idx, V in enumerate(V_neurons):
+            am = self._alpha_m(V)
+            bm = self._beta_m(V)
+            ah = self._alpha_h(V)
+            bh = self._beta_h(V)
+            an = self._alpha_n(V)
+            bn = self._beta_n(V)
 
-    g_Na = params.get("g_Na", 120.0)
-    if g_Na <= 0:
-        warnings.append("g_Na <= 0 — не будет спайков")
+            tau_m = 1.0 / (am + bm)
+            tau_h = 1.0 / (ah + bh)
+            tau_n = 1.0 / (an + bn)
 
-    g_K = params.get("g_K", 36.0)
-    if g_K <= 0:
-        warnings.append("g_K <= 0 — не будет реполяризации")
+            m_inf = am / (am + bm)
+            h_inf = ah / (ah + bh)
+            n_inf = an / (an + bn)
 
-    E_Na = params.get("E_Na", 50.0)
-    E_K = params.get("E_K", -75.0)
-    if E_Na <= E_K:
-        warnings.append("E_Na <= E_K — некорректные равновесные потенциалы")
+            self.m[idx] = m_inf + (self.m[idx] - m_inf) * np.exp(-self.dt / tau_m)
+            self.h[idx] = h_inf + (self.h[idx] - h_inf) * np.exp(-self.dt / tau_h)
+            self.n[idx] = n_inf + (self.n[idx] - n_inf) * np.exp(-self.dt / tau_n)
 
-    neuron_nodes = params.get("neuron_nodes", [])
-    if len(neuron_nodes) == 0:
-        warnings.append("Список нейронных узлов пуст")
-    if any(n < 0 for n in neuron_nodes):
-        warnings.append("Отрицательные индексы узлов")
+    def compute_current(self, V_neurons, c_ions, z_ions):
+        """Считает мембранный ток I_ion для нейронов.
+        
+        V_neurons: потенциал в узлах нейронов (из основного солвера)
+        c_ions: концентрации (для расчёта равновесных потенциалов по Нернсту, если нужно)
+        z_ions: заряды
+        
+        Пока используются фиксированные E_Na, E_K.
+        """
+        I_Na = self.g_Na * (self.m ** 3) * self.h * (V_neurons - self.E_Na)
+        I_K = self.g_K * (self.n ** 4) * (V_neurons - self.E_K)
+        I_L = self.g_L * (V_neurons - self.E_L)
+        
+        I_total = I_Na + I_K + I_L
+        self.last_current = I_total
+        return I_total
 
-    summary = "OK" if not warnings else f"{len(warnings)} предупреждений"
-    confidence = 0.6
+    def apply_to_graph(self, phi_global, c_global):
+        """Обновляет глобальный потенциал phi на основе нейро-активности.
+        
+        1. Берём phi в узлах neuron_indices.
+        2. Считаем токи I.
+        3. Обновляем V_new = V_old - I * dt / C_m.
+        4. Вставляем обновлённые значения обратно в phi_global.
+        """
+        if len(self.neuron_indices) == 0:
+            return phi_global
 
-    return summary, warnings, suggestions, confidence
+        V_local = phi_global[self.neuron_indices]
+        self.update_gates(V_local)
+        I = self.compute_current(V_local, c_global, np.array([1, 1, -1, 2]))
+        
+        dV = -I * self.dt / self.C_m
+        V_new = V_local + dV
+        V_new = np.clip(V_new, -90.0, 60.0)
 
+        phi_updated = phi_global.copy()
+        phi_updated[self.neuron_indices] = V_new
 
-def analyze_neuron(neuron, backend):
-    """Анализ нейрона через любой бэкенд (manual/local/api)."""
-    n_neurons = len(neuron.neuron_indices)
-
-    if n_neurons == 0:
-        return AnalysisResult(
-            summary="Нет нейронных узлов",
-            warnings=[],
-            suggestions=[],
-            confidence=0.5,
-            backend=backend.name,
-        )
-
-    # Если бэкенд — ManualBackend, используем эвристики напрямую
-    if backend.name == "manual":
-        summary, warnings, suggestions, confidence = manual_neuron_analysis(neuron)
-        return AnalysisResult(summary, warnings, suggestions, confidence, "manual")
-
-    # Для local/api — передаём через стандартный analyze
-    context = {
-        "neuron": True,
-        "neuron_indices": neuron.neuron_indices.tolist(),
-        "m": neuron.m.tolist(),
-        "h": neuron.h.tolist(),
-        "n": neuron.n.tolist(),
-        "last_current": neuron.last_current.tolist(),
-        "dt": neuron.dt,
-        "g_Na": neuron.g_Na,
-        "g_K": neuron.g_K,
-        "E_Na": neuron.E_Na,
-        "E_K": neuron.E_K,
-    }
-    dummy_conc = np.array([neuron.m, neuron.h, neuron.n])
-    dummy_charges = np.array([1, 1, 1])
-    return backend.analyze(dummy_conc, dummy_charges, 0, context)
-
-
-def validate_neuron(neuron, backend):
-    """Валидация параметров нейрона."""
-    params = {
-        "dt": neuron.dt,
-        "g_Na": neuron.g_Na,
-        "g_K": neuron.g_K,
-        "E_Na": neuron.E_Na,
-        "E_K": neuron.E_K,
-        "neuron_nodes": neuron.neuron_indices.tolist(),
-    }
-
-    if backend.name == "manual":
-        summary, warnings, suggestions, confidence = manual_neuron_validation(params)
-        return AnalysisResult(summary, warnings, suggestions, confidence, "manual")
-
-    return backend.validate_params(params)
+        return phi_updated
