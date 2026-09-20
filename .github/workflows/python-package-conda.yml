@@ -23,9 +23,10 @@ jobs:
         python -m pip install flake8
         python -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
         python -m flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Run biological tests
+    - name: Install pytest
       run: |
-        python tests/test_biological.py
-    - name: Run Boltzmann tests
+        python -m pip install pytest
+    - name: Run tests
       run: |
-        python tests/test_boltzmann.py
+        python -m pytest tests/ -v
+
