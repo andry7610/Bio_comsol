@@ -1,5 +1,5 @@
 # config.yaml — Физические константы и параметры модели
-# GAK-001 Bio-Diffusion v0.8
+# GAK-001 Bio-Diffusion v0.9
 
 physics_constants:
   T: 310.0
@@ -71,6 +71,13 @@ neuron:
 synapse:
   enabled: false
   V_threshold: -20.0
+  use_stdp: false
+  A_plus: 0.01
+  A_minus: 0.012
+  tau_plus: 20.0
+  tau_minus: 20.0
+  w_min: 0.0
+  w_max: 10.0
   synapses:
     - {pre: 5, post: 10, weight: 0.5, E_syn: 0.0, tau_syn: 3.0, synapse_type: "excitatory"}
     - {pre: 10, post: 15, weight: 0.3, E_syn: 0.0, tau_syn: 3.0, synapse_type: "excitatory"}
