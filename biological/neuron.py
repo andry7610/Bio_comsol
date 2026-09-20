@@ -68,7 +68,6 @@ class NeuronLayer:
         return 0.125 * np.exp(-(V + 65.0) / 80.0)
 
     def update_gates(self, V_neurons):
-        """Обновляет переменные ворот (m, h, n) для всех нейронов."""
         for idx in range(len(V_neurons)):
             V = V_neurons[idx]
             am = self._alpha_m(V)
@@ -91,7 +90,6 @@ class NeuronLayer:
             self.n[idx] = n_inf + (self.n[idx] - n_inf) * np.exp(-self.dt / tau_n)
 
     def compute_nernst(self, c_global, z_ions):
-        """Считает E_Na и E_K по формуле Нернста из концентраций."""
         n_neurons = len(self.neuron_indices)
         if n_neurons == 0:
             return np.array([]), np.array([])
@@ -122,7 +120,6 @@ class NeuronLayer:
         return E_Na, E_K
 
     def compute_current(self, V_neurons, c_ions=None, z_ions=None):
-        """Считает мембранный ток I_ion для нейронов."""
         if self.use_nernst and c_ions is not None and z_ions is not None:
             E_Na, E_K = self.compute_nernst(c_ions, z_ions)
         else:
@@ -138,7 +135,6 @@ class NeuronLayer:
         return I_total
 
     def apply_to_graph(self, phi_global, c_global=None):
-        """Обновляет глобальный потенциал phi на основе нейро-активности."""
         if len(self.neuron_indices) == 0:
             return phi_global
 
@@ -160,3 +156,4 @@ class NeuronLayer:
         phi_updated[self.neuron_indices] = V_new
 
         return phi_updated
+# === END ===
