@@ -1,16 +1,12 @@
 """biological/neuron.py — Модель Ходжкина-Хаксли на графе.
 
+Версия: v0.8
+  - I_ext в apply_to_graph — приём синаптического тока от SynapseLayer
+
 Версия: v0.6.2
   - np.clip(V, -100, 100) в rate-функциях — защита от overflow exp
   - np.errstate в rate-функциях — подавление RuntimeWarning
   - last_current — сохранение тока для neuron_analysis
-
-Версия: v0.6
-  - Динамический Нернст: E_Na, E_K из концентраций
-  - use_nernst флаг
-
-Версия: v0.5
-  - ИИ-интеграция (network/) — автоанализ состояния нейрона
 """
 
 import numpy as np
@@ -49,37 +45,28 @@ class NeuronLayer:
         self.dt = dt
         self.use_nernst = use_nernst
 
-        # Проводимости ионных каналов (mS/cm²)
         self.g_Na = g_Na
         self.g_K = g_K
         self.g_L = g_L
 
-        # Равновесные потенциалы (мВ)
         self.E_Na = E_Na
         self.E_K = E_K
         self.E_L = E_L
 
-        # Динамические равновесные потенциалы (None, пока не вычислены)
         self.E_Na_dynamic = None
         self.E_K_dynamic = None
 
-        # Ёмкость мембраны (мкФ/cm²)
         self.C_m = C_m
-
-        # Потенциал покоя (мВ)
         self.V_rest = V_rest
 
-        # Ограничения потенциала
         self.V_clip_min = V_clip_min
         self.V_clip_max = V_clip_max
 
-        # Ворота Ходжкина-Хаксли
         self.m = np.zeros(self.n_neurons)
         self.h = np.zeros(self.n_neurons)
         self.n = np.zeros(self.n_neurons)
         self.last_current = np.zeros(self.n_neurons)
 
-        # Инициализация ворот в стационарном состоянии при V_rest
         if self.n_neurons > 0:
             V_init = np.full(self.n_neurons, V_rest)
             a_m = self._alpha_m(V_init)
@@ -93,7 +80,6 @@ class NeuronLayer:
             self.h = a_h / (a_h + b_h)
             self.n = a_n / (a_n + b_n)
 
-        # ИИ-бэкенд
         self.ai_backend = ai_backend or get_backend()
         self.analyze_every = analyze_every
         self.last_analysis = None
@@ -136,7 +122,6 @@ class NeuronLayer:
     # --- Обновление ворот ---
 
     def update_gates(self, V, dt=None):
-        """Обновляет ворота m, h, n по схеме forward Euler."""
         if self.n_neurons == 0:
             return
 
@@ -161,25 +146,14 @@ class NeuronLayer:
     # --- Расчёт тока ---
 
     def compute_current(self, V, c_ions=None, z_ions=None):
-        """Вычисляет ионный ток через мембрану.
-
-        I = g_Na * m³ * h * (V - E_Na) +
-            g_K  * n⁴ *     (V - E_K)  +
-            g_L  *           (V - E_L)
-
-        Если use_nernst=True и переданы c_ions, то E_Na и E_K
-        пересчитываются динамически через compute_nernst.
-        """
         if self.n_neurons == 0:
             return np.array([])
 
-        # Динамический Нернст
         if self.use_nernst and c_ions is not None:
             if z_ions is None:
-                z_ions = np.array([1, 1, -1, 2])  # Na, K, Cl, Ca
+                z_ions = np.array([1, 1, -1, 2])
             self.compute_nernst(c_ions, z_ions)
 
-        # Выбор E_Na, E_K
         if self.use_nernst and self.E_Na_dynamic is not None:
             E_Na = self.E_Na_dynamic
             E_K = self.E_K_dynamic
@@ -197,25 +171,16 @@ class NeuronLayer:
     # --- Динамический Нернст ---
 
     def compute_nernst(self, c_global, z_ions):
-        """Вычисляет равновесные потенциалы из уравнения Нернста.
-
-        E = (RT / (z * F)) * ln(c_out / c_in)
-
-        Returns (E_Na, E_K) для узлов-нейронов.
-        При NaN/inf (нулевые концентрации) — fallback на статические E.
-        """
         if self.n_neurons == 0:
             self.E_Na_dynamic = np.array([])
             self.E_K_dynamic = np.array([])
             return np.array([]), np.array([])
 
-        RT_F = 26.7  # мВ, RT/F при T=310 K
+        RT_F = 26.7
 
-        # Na (индекс 0)
         c_out_Na = np.mean(c_global[0])
         c_in_Na = c_global[0][self.neuron_indices]
 
-        # K (индекс 1)
         c_out_K = np.mean(c_global[1])
         c_in_K = c_global[1][self.neuron_indices]
 
@@ -223,7 +188,6 @@ class NeuronLayer:
             E_Na = (RT_F / z_ions[0]) * np.log(c_out_Na / c_in_Na)
             E_K = (RT_F / z_ions[1]) * np.log(c_out_K / c_in_K)
 
-        # Защита от NaN / inf
         E_Na = np.where(np.isnan(E_Na) | np.isinf(E_Na), self.E_Na, E_Na)
         E_K = np.where(np.isnan(E_K) | np.isinf(E_K), self.E_K, E_K)
 
@@ -234,7 +198,7 @@ class NeuronLayer:
 
     # --- Применение к графу ---
 
-    def apply_to_graph(self, phi, c=None):
+    def apply_to_graph(self, phi, c=None, I_ext=None):
         """Обновляет потенциал на узлах-нейронах.
 
         Parameters
@@ -243,6 +207,8 @@ class NeuronLayer:
             Потенциал на графе (N,).
         c : np.ndarray, optional
             Концентрации ионов (n_ions, N) — для динамического Нернста.
+        I_ext : np.ndarray, optional
+            Внешний ток (синаптический) для каждого нейрона (n_neurons,).
 
         Returns
         -------
@@ -262,14 +228,15 @@ class NeuronLayer:
         else:
             I = self.compute_current(V)
 
-        # C_m * dV/dt = -I  →  V_new = V - dt * I / C_m
+        if I_ext is not None:
+            I = I + I_ext
+
         V_new = V - self.dt * I / self.C_m
         V_new = np.clip(V_new, self.V_clip_min, self.V_clip_max)
         phi[self.neuron_indices] = V_new
 
         self.step_count += 1
 
-        # Периодический ИИ-анализ
         if self.analyze_every > 0 and self.step_count % self.analyze_every == 0:
             self.analyze_state()
 
@@ -278,7 +245,6 @@ class NeuronLayer:
     # --- ИИ-анализ ---
 
     def analyze_state(self):
-        """Анализ текущего состояния нейрона через ИИ-бэкенд."""
         context = {
             "neuron_indices": self.neuron_indices,
             "V_rest": self.V_rest,
@@ -293,7 +259,9 @@ class NeuronLayer:
             "use_nernst": self.use_nernst,
         }
         self.last_analysis = self.ai_backend.analyze(
-            concentrations=np.stack([self.m, self.h, self.n]) if self.n_neurons > 0 else np.zeros((3, 0)),
+            concentrations=(np.stack([self.m, self.h, self.n])
+                            if self.n_neurons > 0
+                            else np.zeros((3, 0))),
             charges=np.array([1, 1, 1]),
             time_step=self.step_count,
             context=context,
@@ -301,7 +269,6 @@ class NeuronLayer:
         return self.last_analysis
 
     def validate_params(self):
-        """Проверка параметров нейрона через ИИ-бэкенд."""
         params = {
             "dt": self.dt,
             "g_Na": self.g_Na,
