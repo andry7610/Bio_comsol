@@ -1,0 +1,153 @@
+"""main.py — Конфиг-драйвенный запуск симуляции Bio-COMSOL.
+
+Использование:
+    python main.py config.yaml
+    python main.py config.yaml --steps 1000 --output-every 100
+"""
+
+import argparse
+import numpy as np
+import yaml
+
+from network.graph import Graph
+from biological.diffusion import BiologicalDiffusion
+from biological.neuron import NeuronLayer
+
+
+def load_config(path):
+    """Загружает YAML-конфиг."""
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def build_graph(cfg):
+    """Создаёт граф из секции 'graph' конфига."""
+    g = cfg.get('graph', {})
+    return Graph(
+        N=g.get('N', 20),
+        topology=g.get('topology', 'chain'),
+        p_edge=g.get('p_edge'),
+        seed=g.get('seed', 42),
+        conductivity=g.get('conductivity', 1.0),
+        cross_section=g.get('cross_section', 1e-8),
+    )
+
+
+def build_ions(cfg):
+    """Создаёт список ионов из секции 'ion_species' конфига."""
+    species = cfg.get('ion_species', {})
+    ions = []
+    for name, params in species.items():
+        ions.append({
+            'name': name,
+            'D': params['D'],
+            'z': params['z'],
+            'c0': params['c0'],
+            'c_left': params.get('c_left', params['c0']),
+            'c_right': params.get('c_right', params['c0']),
+        })
+    return ions
+
+
+def build_solver(cfg, graph, ions):
+    """Создаёт BiologicalDiffusion из конфига."""
+    phys = cfg.get('physics_constants', {})
+    solver_cfg = cfg.get('solver', {})
+
+    F = phys.get('F', 96485.0)
+    R = phys.get('R', 8.314)
+    T = phys.get('T', 310.0)
+    F_RT = F / (R * T)
+
+    return BiologicalDiffusion(
+        graph=graph,
+        ions=ions,
+        dt=solver_cfg.get('dt', 1e-3),
+        F_RT=F_RT,
+        membrane_potential=solver_cfg.get('membrane_potential', -1.8),
+        picard_tol=solver_cfg.get('picard_tol', 1e-6),
+        picard_max_iter=solver_cfg.get('picard_max_iter', 20),
+        analyze_every=solver_cfg.get('analyze_every', 0),
+    )
+
+
+def build_neuron(cfg, graph):
+    """Создаёт NeuronLayer из секции 'neuron' конфига."""
+    n = cfg.get('neuron', {})
+    if not n.get('enabled', False):
+        return None
+
+    return NeuronLayer(
+        graph=graph,
+        neuron_nodes=n.get('neuron_nodes', []),
+        dt=n.get('dt', 0.01),
+        use_nernst=n.get('use_nernst', False),
+    )
+
+
+def run_simulation(cfg, n_steps=None, output_every=None):
+    """Запускает симуляцию из конфига.
+
+    Args:
+        cfg: загруженный конфиг (dict)
+        n_steps: число шагов (если None — берётся из cfg['simulation'])
+        output_every: частота вывода (если None — из cfg['simulation'])
+
+    Returns:
+        (solver, neuron) — объекты после симуляции
+    """
+    sim_cfg = cfg.get('simulation', {})
+    n_steps = n_steps if n_steps is not None else sim_cfg.get('n_steps', 100)
+    output_every = (output_every if output_every is not None
+                    else sim_cfg.get('output_every', 10))
+
+    graph = build_graph(cfg)
+    ions = build_ions(cfg)
+    solver = build_solver(cfg, graph, ions)
+    neuron = build_neuron(cfg, graph)
+
+    print("Bio-COMSOL симуляция")
+    print(f"  Граф: {graph.N} узлов, {len(graph.edges)} рёбер")
+    print(f"  Ионов: {solver.n_ions} — {solver.names}")
+    print(f"  Нейрон: {'вкл' if neuron else 'выкл'}")
+    if neuron:
+        print(f"    Узлы: {list(neuron.neuron_indices)}")
+        print(f"    Нернст: {'да' if neuron.use_nernst else 'нет'}")
+    print(f"  Шагов: {n_steps}")
+    print(f"  dt: {solver.dt}")
+    print()
+
+    for step in range(n_steps):
+        iters = solver.step()
+
+        if neuron is not None:
+            solver.phi = neuron.apply_to_graph(solver.phi, solver.c)
+
+        if (step + 1) % output_every == 0:
+            qn_err = solver.quasineutrality_error()
+            charge = solver.total_charge()
+            print(f"  Шаг {step + 1:5d} | Пикар: {iters} | "
+                  f"квазинейтральность: {qn_err:.2e} | "
+                  f"заряд: {charge:.2e}")
+
+    print()
+    print("Симуляция завершена.")
+    return solver, neuron
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Bio-COMSOL симуляция')
+    parser.add_argument('config', help='Путь к config.yaml')
+    parser.add_argument('--steps', type=int, default=None,
+                        help='Число шагов (по умолчанию из конфига)')
+    parser.add_argument('--output-every', type=int, default=None,
+                        help='Вывод каждые N шагов (по умолчанию из конфига)')
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    run_simulation(cfg, args.steps, args.output_every)
+
+
+if __name__ == '__main__':
+    main()
+# === END ===
