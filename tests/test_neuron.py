@@ -434,4 +434,40 @@ class TestNernst:
         phi_new = neuron.apply_to_graph(phi, c)
         assert phi_new.shape == (20,)
         assert neuron.E_Na_dynamic is not None
+
+class TestOverflowProtection:
+    """Тесты защиты от переполнения exp при экстремальных V."""
+
+    @pytest.fixture
+    def graph(self):
+        return Graph(N=20, topology="chain")
+
+    @pytest.fixture
+    def neuron(self, graph):
+        return NeuronLayer(graph, neuron_nodes=[5, 10, 15], dt=0.01)
+
+    def test_extreme_v_no_nan(self, neuron):
+        """V = ±1e6 → ворота не NaN."""
+        V = np.array([1e6, -1e6, 500.0])
+        neuron.update_gates(V, dt=0.01)
+        assert not np.any(np.isnan(neuron.m))
+        assert not np.any(np.isnan(neuron.h))
+        assert not np.any(np.isnan(neuron.n))
+
+    def test_extreme_v_no_inf_current(self, neuron):
+        """V = ±1e6 → ток не inf."""
+        V = np.array([1e6, -1e6, 500.0])
+        I = neuron.compute_current(V)
+        assert not np.any(np.isinf(I))
+        assert not np.any(np.isnan(I))
+
+    def test_extreme_v_gates_in_range(self, neuron):
+        """V = ±1e6 → ворота остаются в [0, 1]."""
+        V = np.array([1e6, -1e6, 500.0])
+        neuron.update_gates(V, dt=0.01)
+        assert np.all(neuron.m >= 0) and np.all(neuron.m <= 1)
+        assert np.all(neuron.h >= 0) and np.all(neuron.h <= 1)
+        assert np.all(neuron.n >= 0) and np.all(neuron.n <= 1)
+# === END ===
+
 # === END ===
