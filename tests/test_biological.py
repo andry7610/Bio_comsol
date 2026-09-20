@@ -1,4 +1,4 @@
- """tests/test_biological.py — Тесты BiologicalDiffusion."""
+"""tests/test_biological.py — Тесты BiologicalDiffusion."""
 
 import numpy as np
 import pytest
