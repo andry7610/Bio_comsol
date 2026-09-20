@@ -1,16 +1,21 @@
-"""
-biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
+"""biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
+
+Версия: v0.5
+
+Отличия от v0.4:
+  - Интеграция ИИ-бэкендов (network/) — автоанализ симуляции
+  - Метод analyze_state() — вызов нейросети в любой момент
+  - Метод validate_params() — проверка параметров перед запуском
+  - Периодический анализ в step() через analyze_every
 
 Версия: v0.4
-
-Отличия от synthetic v0.3:
   - Квазинейтральное приближение: Σ z_k · c_k ≈ 0 в каждом узле
   - Мембранный потенциал: градиент φ на границах (по умолчанию -70 мВ)
   - 4 иона: Na, K, Cl, Ca (конфигурируется)
   - Итерации Пикара для электродиффузионного члена
   - Потенциал φ — внешний (фиксированный), не самостоясогласованный
 
-План на v0.5:
+План на v0.6:
   - Самостоясогласованный потенциал из условия квазинейтральности
   - Метод Ньютона
   - Активные ионные каналы (Hodgkin-Huxley)
@@ -19,6 +24,8 @@ biological/diffusion.py — Квазинейтральная модель Нер
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+
+from network import get_backend, AnalysisResult
 
 
 class BiologicalDiffusion:
@@ -40,11 +47,16 @@ class BiologicalDiffusion:
 
     Граничные условия:
         Дирихле («ванна») на граничных узлах графа
+
+    ИИ-интеграция (v0.5):
+        Периодический автоанализ через network.get_backend().
+        Анализируются: стабильность, квазинейтральность, физичность.
     """
 
     def __init__(self, graph, ions, dt=1e-3, F_RT=1.0,
                  membrane_potential=-1.8,
-                 picard_tol=1e-6, picard_max_iter=20):
+                 picard_tol=1e-6, picard_max_iter=20,
+                 ai_backend=None, analyze_every=0):
 
         self.graph = graph
         self.N = graph.N
@@ -94,6 +106,11 @@ class BiologicalDiffusion:
 
         self.step_count = 0
         self.last_picard_iters = 0
+
+        # --- ИИ-бэкенд ---
+        self.ai_backend = ai_backend or get_backend()
+        self.analyze_every = analyze_every
+        self.last_analysis: AnalysisResult | None = None
 
     def _build_incidence(self):
         """Матрица инцидентности B (N × E) для потоков на рёбрах."""
@@ -146,6 +163,51 @@ class BiologicalDiffusion:
         """Максимальная невязка квазинейтральности по узлам."""
         return float(np.max(np.abs(self.charge_per_node())))
 
+    # --- ИИ-анализ ---
+
+    def analyze_state(self) -> AnalysisResult:
+        """Анализ текущего состояния симуляции через ИИ-бэкенд.
+
+        Возвращает AnalysisResult с summary, warnings, suggestions.
+        Работает с любым бэкендом: manual (всегда), local (Ollama), api.
+        """
+        context = {
+            "ion_names": self.names,
+            "phi": self.phi,
+            "membrane_potential": self.phi_membrane,
+            "dt": self.dt,
+        }
+        self.last_analysis = self.ai_backend.analyze(
+            concentrations=self.c,
+            charges=self.z,
+            time_step=self.step_count,
+            context=context,
+        )
+        return self.last_analysis
+
+    def validate_params(self) -> AnalysisResult:
+        """Проверка параметров симуляции через ИИ-бэкенд.
+
+        Вызывается до запуска симуляции для раннего обнаружения проблем.
+        """
+        params = {
+            "dt": self.dt,
+            "F_RT": self.F_RT,
+            "membrane_potential": self.phi_membrane,
+            "ions": [
+                {
+                    "name": self.names[k],
+                    "D": float(self.D[k]),
+                    "z": int(self.z[k]),
+                    "c0": float(self.c0_vals[k]),
+                    "c_left": float(self.c_boundary[k, 0]),
+                    "c_right": float(self.c_boundary[k, 1]),
+                }
+                for k in range(self.n_ions)
+            ],
+        }
+        return self.ai_backend.validate_params(params)
+
     # --- Шаг по времени ---
 
     def step(self):
@@ -156,6 +218,9 @@ class BiologicalDiffusion:
 
         Итерации Пикара: adv_k пересчитывается на каждой итерации
         с обновлёнными концентрациями.
+
+        Если analyze_every > 0, каждые analyze_every шагов
+        запускается ИИ-анализ состояния.
         """
         c_old = self.c.copy()
         c_iter = c_old.copy()
@@ -186,4 +251,9 @@ class BiologicalDiffusion:
         self.c = c_iter
         self.step_count += 1
         self.last_picard_iters = iteration + 1
+
+        # Периодический ИИ-анализ
+        if self.analyze_every > 0 and self.step_count % self.analyze_every == 0:
+            self.analyze_state()
+
         return self.last_picard_iters
