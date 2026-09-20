@@ -97,6 +97,13 @@ def build_synapses(cfg, graph, dt=0.01):
         synapses=synapse_list,
         dt=dt,
         V_threshold=s.get('V_threshold', -20.0),
+        use_stdp=s.get('use_stdp', False),
+        A_plus=s.get('A_plus', 0.01),
+        A_minus=s.get('A_minus', 0.012),
+        tau_plus=s.get('tau_plus', 20.0),
+        tau_minus=s.get('tau_minus', 20.0),
+        w_min=s.get('w_min', 0.0),
+        w_max=s.get('w_max', 10.0),
     )
 
 
@@ -122,6 +129,7 @@ def run_simulation(cfg, n_steps=None, output_every=None):
     print(f"  Синапсы: {'вкл' if synapse else 'выкл'}")
     if synapse:
         print(f"    Синапсов: {synapse.n_syn}")
+        print(f"    STDP: {'да' if synapse.use_stdp else 'нет'}")
     print(f"  Самосогласование: {'да' if solver.self_consistent else 'нет'}")
     print(f"  Метод: {'Ньютон' if solver.use_newton else 'Пикар'}")
     print(f"  Шагов: {n_steps}")
