@@ -10,7 +10,7 @@ physics_constants:
   F: 96485.33212       # Кл/моль
   eps0: 8.8541878128e-12  # Ф/м
   RT: 2578.48        # Дж/моль = R * T
-  F_RT: 38.94        # 1/В = F / (R * T)
+  F_RT: 37.44        # 1/В = F / (R * T)
   thermal_voltage: 0.02569  # В = RT / F
 
 ion_species:
