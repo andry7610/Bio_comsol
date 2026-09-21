@@ -1,5 +1,10 @@
 """biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
 
+Версия: v0.7.1
+  - ИСПРАВЛЕНО: знак диффузии (I + dt*D*L вместо I - dt*D*L)
+  - ИСПРАВЛЕНО: масштаб адвекции (B_unweighted для grad_phi, w вместо w²)
+  - ИСПРАВЛЕНО: знак адвекции в Picard и Newton (- dt * adv)
+
 Версия: v0.7
   - Метод Ньютона с аналитическим якобианом (use_newton=True)
   - Квадратичная сходимость: 1-3 итерации вместо 20 у Пикара
@@ -30,9 +35,13 @@ class BiologicalDiffusion:
 
         ∂c_k/∂t = D_k · ∇²c_k + D_k · z_k · (F/RT) · ∇(c_k · ∇φ)
 
+    В графе: L·c ≈ -∇²c, B@flux ≈ -∇·flux.
+    Уравнение: ∂c/∂t = -D·L·c - adv_code(c)
+    где adv_code = B @ (D·z·F_RT · c_mid · (B_unw.T @ phi))
+
     Метод Ньютона (v0.7):
-        Построение якобиана J_k = I - dt·D_k·L - dt·adv_jacobian_k
-        где adv_jacobian_k = D_k·z_k·(F/RT)·B·diag(B^T·φ)·E_mid
+        Построение якобиана J_k = I + dt·D_k·L + dt·adv_jacobian_k
+        где adv_jacobian_k = D_k·z_k·(F/RT)·B·diag(B_unw^T·φ)·E_mid
 
         При фиксированном φ система линейна → Ньютон сходится за 1 шаг.
         При self_consistent=True — за 2-3 шага.
@@ -90,10 +99,12 @@ class BiologicalDiffusion:
         self.boundary_nodes = {0, self.N - 1} if self.N > 1 else set()
 
         # --- Матрицы системы (предрассчитанные для Пикара) ---
+        # ИСПРАВЛЕНО: I + dt*D*L (вместо I - dt*D*L)
+        # L·c ≈ -∇²c, поэтому для диффузии нужен +
         self.I = sp.eye(self.N, format='csr')
         self.A_mats = []
         for k in range(self.n_ions):
-            A = (self.I - self.dt * self.D[k] * self.L).tolil()
+            A = (self.I + self.dt * self.D[k] * self.L).tolil()
             for node in self.boundary_nodes:
                 A[node, :] = 0
                 A[node, node] = 1.0
@@ -108,6 +119,7 @@ class BiologicalDiffusion:
             self.A_poisson = A_pois.tocsr()
 
         # --- Матрица инцидентности B и средних E_mid ---
+        # ИСПРАВЛЕНО: B_unweighted для корректного масштаба адвекции
         self._build_incidence()
 
         self.step_count = 0
@@ -124,22 +136,31 @@ class BiologicalDiffusion:
         """Матрица инцидентности B (N × E) и средних E_mid (E × N).
 
         B[node, edge] — поток из узла в ребро (с весом).
+        B_unweighted[node, edge] — то же, но веса = 1 (для grad_phi).
         E_mid[edge, node] — 0.5 если узел — конец ребра, 0 иначе.
         c_mid = E_mid @ c_k — средняя концентрация на рёбрах.
         """
         E = len(self.edges)
         if E == 0:
             self.B = sp.csr_matrix((self.N, 0))
+            self.B_unweighted = sp.csr_matrix((self.N, 0))
             self.E_mid = sp.csr_matrix((0, self.N))
             return
 
         row_b, col_b, data_b = [], [], []
+        row_bu, col_bu, data_bu = [], [], []
         row_e, col_e, data_e = [], [], []
 
         for e_idx, (i, j, w) in enumerate(self.edges):
+            # Взвешенная матрица B (для дивергенции)
             row_b.extend([i, j])
             col_b.extend([e_idx, e_idx])
             data_b.extend([-w, w])
+
+            # Невзвешенная матрица B_unweighted (для градиента phi)
+            row_bu.extend([i, j])
+            col_bu.extend([e_idx, e_idx])
+            data_bu.extend([-1.0, 1.0])
 
             row_e.extend([e_idx, e_idx])
             col_e.extend([i, j])
@@ -147,6 +168,8 @@ class BiologicalDiffusion:
 
         self.B = sp.csr_matrix((data_b, (row_b, col_b)),
                               shape=(self.N, E))
+        self.B_unweighted = sp.csr_matrix((data_bu, (row_bu, col_bu)),
+                                          shape=(self.N, E))
         self.E_mid = sp.csr_matrix((data_e, (row_e, col_e)),
                                    shape=(E, self.N))
 
@@ -157,11 +180,16 @@ class BiologicalDiffusion:
         return self.E_mid @ c_k
 
     def _advective_term(self, c_k, z_k, D_k):
-        """Электрический поток для иона k."""
+        """Электрический поток для иона k.
+
+        B@flux ≈ -∇·flux, поэтому возвращаем B@flux (знак учитывается
+        при подстановке в уравнение: ∂c/∂t = -D·L·c - adv_code).
+        """
         if len(self.edges) == 0:
             return np.zeros(self.N)
         c_mid = self._edge_mid_conc(c_k)
-        grad_phi = self.B.T @ self.phi
+        # ИСПРАВЛЕНО: B_unweighted для корректного масштаба (w вместо w²)
+        grad_phi = self.B_unweighted.T @ self.phi
         flux = D_k * z_k * self.F_RT * c_mid * grad_phi
         return self.B @ flux
 
@@ -247,7 +275,10 @@ class BiologicalDiffusion:
         return iters
 
     def _step_picard(self):
-        """Шаг Пикара: backward Euler + итерации фиксированной точки."""
+        """Шаг Пикара: backward Euler + итерации фиксированной точки.
+
+        Уравнение: (I + dt·D·L)·c_new = c_old - dt·adv(c_iter)
+        """
         c_old = self.c.copy()
         c_iter = c_old.copy()
 
@@ -256,7 +287,8 @@ class BiologicalDiffusion:
 
             for k in range(self.n_ions):
                 adv = self._advective_term(c_iter[k], self.z[k], self.D[k])
-                rhs = c_old[k] + self.dt * adv
+                # ИСПРАВЛЕНО: минус перед dt*adv (B@flux ≈ -∇·flux)
+                rhs = c_old[k] - self.dt * adv
                 rhs[0] = self.c_boundary[k, 0]
                 if self.N > 1:
                     rhs[self.N - 1] = self.c_boundary[k, 1]
@@ -279,7 +311,9 @@ class BiologicalDiffusion:
     def _step_newton(self):
         """Шаг Ньютона: backward Euler + аналитический якобиан.
 
-        J_k = I - dt·D_k·L - dt·D_k·z_k·(F/RT)·B·diag(B^T·φ)·E_mid
+        Уравнение: (I + dt·D·L)·c_new = c_old - dt·adv(c_new)
+        Невязка: F(c) = (I + dt·D·L)·c - c_old + dt·adv(c) = 0
+        Якобиан: J = I + dt·D·L + dt·adv_jac
 
         При фиксированном φ система линейна → 1 итерация.
         При self_consistent=True φ пересчитывается → 2-3 итерации.
@@ -290,19 +324,20 @@ class BiologicalDiffusion:
         for iteration in range(self.newton_max_iter):
             c_prev = c_iter.copy()
 
-            # Градиент φ на рёбрах (зависит от текущего φ)
-            grad_phi = self.B.T @ self.phi  # (E,)
+            # ИСПРАВЛЕНО: B_unweighted для градиента phi
+            grad_phi = self.B_unweighted.T @ self.phi  # (E,)
 
             for k in range(self.n_ions):
                 # Якобиан адвективного члена
                 if len(self.edges) > 0:
                     adv_jac = (self.D[k] * self.z[k] * self.F_RT
                                * (self.B @ sp.diags(grad_phi) @ self.E_mid))
+                    # ИСПРАВЛЕНО: + dt*D*L + dt*adv_jac (вместо - -)
                     J_k = (self.I
-                           - self.dt * self.D[k] * self.L
-                           - self.dt * adv_jac)
+                           + self.dt * self.D[k] * self.L
+                           + self.dt * adv_jac)
                 else:
-                    J_k = self.I - self.dt * self.D[k] * self.L
+                    J_k = self.I + self.dt * self.D[k] * self.L
 
                 # Граничные условия Дирихле
                 J_k = J_k.tolil()
@@ -333,11 +368,4 @@ class BiologicalDiffusion:
         self.last_newton_iters = iteration + 1
         self.last_iters = self.last_newton_iters
 
-        # Пуассон уже решён внутри цикла, но если self_consistent=False
-        # и didn't enter the if — ничего не делаем
-        if self.self_consistent and self.last_newton_iters == 1:
-            # Уже решён внутри цикла
-            pass
-
         return self.last_newton_iters
-# === END ===
