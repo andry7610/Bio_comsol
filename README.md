@@ -1,132 +1,167 @@
 # Bio-COMSOL
 
-Ионный транспорт на графах: модель Нернста-Планка-Пуассона для синтетических
-ионных систем и биологической ткани.
+Ионный транспорт на графах: модель Нернста-Планка-Пуассона для синтетических ионных систем и биологической ткани.
+
+Validated against analytical solutions for Nernst equilibrium, 1D diffusion (first-order convergence), and Boltzmann distribution.
+
+![CI](https://github.com/andry7610/Bio_comsol/actions/workflows/python-package.yml/badge.svg)
+
+## Что это
+
+Модульная система для моделирования:
+- Ионного транспорта в электролитах и биологических тканях
+- Мембранных потенциалов через уравнение Пуассона
+- Нейронов Ходжкина-Хаксли с динамическим Нернстом
+- Синапсов и сетей с обучением через STDP
+- Самосогласованного потенциала — phi зависит от концентраций
 
 ## Структура
 
-bio_comsol/ ├── synthetic/ # Рабочий модуль (v0.3) │ ├── diffusion.py # Неявная схема + Пикар │ ├── diffusion_v0.1.py # Архив: явный Эйлер │ └── tests/ ├── biological/ # Каркас (v0.4) │ └── diffusion.py # Заглушка ├── common/ │ ├── graph_utils.py # Генератор графа │ └── solvers.py # Заглушка (spsolve внутри модулей) ├── config.yaml ├── README.md ├── LICENSE └── .gitignore
+Bio_comsol/
+  biological/
+    diffusion.py          # Нернст-Планк-Пуассон, Пикар / Ньютон
+    neuron.py             # Ходжкин-Хаксли, динамический Нернст
+    synapse.py            # Синапсы, STDP, детекция спайков
+    ai_backends.py        # manual / mock / API
+  network/
+    graph.py              # Граф с пространственной метрикой
+  configs/
+    config.yaml           # Все параметры
+  tests/
+    test_biological.py    # 46 тестов: диффузия, Пуассон, Пикар, Ньютон
+    test_neuron.py        # 41 тест: гейты, токи, Нернст, overflow
+    test_synapse.py       # 33 теста: синапсы, STDP, интеграция
+    test_main.py          # 17 тестов: конфиг, граф, солвер, запуск
+    test_validation.py    # 4 теста: аналитическая валидация
+  main.py                 # Точка входа: config + CLI
+  config.yaml
+  README.md
+  LICENSE                 # MIT
 
-text
+## Физика
 
-## Что готово
+### Ионный транспорт (Нернст-Планк-Пуассон)
 
-- **synthetic v0.3** — пореберная неявная схема backward Euler
-  с итерациями Пикара. Безразмерные переменные, `eps* = 1.0`.
-  Устойчива при `F_RT = 1.0`, `dt` до `1e-2`.
-  Сохранение заряда на уровне машинного эпсилона.
-  Граничные условия Дирихле («ванна») и заготовка под мембрану.
+Поток Нернста-Планка:
+J_i = -D_i * grad(c_i) - (D_i * z_i * F / RT) * c_i * grad(phi)
 
-- **biological v0.4** — каркас. Квазинейтральное приближение
-  и метод Ньютона — в планах.
+Уравнение Пуассона:
+laplacian(phi) = -(F / eps) * sum(z_i * c_i)
 
-## Запуск теста
+Схемы:
+- Пикар — линейная сходимость, 20 итераций
+- Ньютон — квадратичная сходимость, 1–2 итерации (аналитический якобиан)
 
-```bash
-pip install numpy scipy
-python -m synthetic.tests.test_synthetic
-Лицензия
+### Нейрон Ходжкина-Хаксли
+
+C_m * dV/dt = I_ext - I_Na - I_K - I_L
+
+С динамическими равновесными потенциалами Нернста:
+E_i = (RT / z_i F) * ln(c_i_out / c_i_in)
+
+Защита от overflow: np.clip(V, -100, 100) перед экспонентами.
+
+### Синапсы и STDP
+
+Проводимостная модель с детекцией спайков и обучением:
+- LTP — pre до post, вес растёт
+- LTD — post до pre, вес падает
+- Клиппинг весов, экспоненциальное затухание
+
+## Валидация
+
+Четыре аналитических теста в tests/test_validation.py:
+
+| Тест | Аналитика | Допуск |
+|------|-----------|--------|
+| Нернст | E = (RT/zF)*ln(c_out/c_in) | rtol < 1e-3 |
+| 1D-диффузия | c0/2 * [1 - erf(x / 2*sqrt(Dt))] | max err < 1e-2 |
+| Порядок сходимости | Ошибка пропорциональна dt | ratio 1.7..2.3 |
+| Больцман | c ~ exp(-z*phi/kT) | R2 > 0.99 |
+
+## Запуск
+
+pip install numpy scipy pyyaml pytest
+
+# Полная симуляция из конфига
+python main.py
+
+# С CLI-параметрами
+python main.py --steps 1000 --dt 1e-4
+
+# Тесты
+python -m pytest tests/ -v
+
+# Только валидация
+python -m pytest tests/test_validation.py -v
+
+## Конфигурация
+
+Всё в config.yaml:
+
+graph:
+  N: 50
+  topology: chain
+  conductivity: 1.0
+  cross_section: 1e-8
+
+ions:
+  - {name: Na, D: 0.01, z: 1, c0: 10.0}
+  - {name: K,  D: 0.02, z: 1, c0: 100.0}
+  - {name: Cl, D: 0.015, z: -1, c0: 110.0}
+  - {name: Ca, D: 0.008, z: 2, c0: 1.0}
+
+solver:
+  method: newton
+  self_consistent: true
+  dt: 1e-4
+
+neuron:
+  enabled: true
+  indices: [20, 25, 30]
+
+synapse:
+  enabled: true
+  stdp: true
+
+## ИИ-бэкенды
+
+Три режима:
+- manual — без ИИ, чистый расчёт
+- mock — тестовый бэкенд для CI
+- api — внешний API (DeepSeek, YandexGPT, локальная модель)
+
+## CI
+
+GitHub Actions запускает при каждом пуше:
+- 156 тестов (pytest)
+- Валидация против аналитики
+- Проверка отсутствия NaN и отрицательных концентраций
+
+Статус: зелёный, 0 warnings, ~9 секунд
+
+## Статус проекта
+
+v0.9 — полная модель: от ионной диффузии до сети нейронов с обучением.
+
+Компонент                  | Статус
+---------------------------|--------
+Нернст-Планк-Пуассон       | готово
+Квазинейтральность          | готово
+Самосогласованный потенциал | готово
+Метод Ньютона              | готово
+Ходжкин-Хаксли             | готово
+Динамический Нернст        | готово
+Синапсы + STDP             | готово
+Аналитическая валидация    | готово
+ИИ-бэкенды                 | готово
+
+В планах (v1.0):
+- Нейромедиаторы и модуляция
+- Глия
+- 2D/3D-ткани
+- Веб-интерфейс
+
+## Лицензия
+
 MIT — используйте, форкайте, развивайте.
-
-text
-
-### `.gitignore`
-
-pycache/ *.pyc *.pyo *.egg-info/ .venv/ venv/ .DS_Store *.log
-
-text
-
-### `common/graph_utils.py`
-
-```python
-"""Минимальный генератор графа для Bio-COMSOL.
-
-Создаёт 1D-цепочку с рёбрами к ближайшим соседям.
-Лапласиан — разреженная матрица.
-"""
-
-import numpy as np
-import scipy.sparse as sp
-
-
-class Graph:
-    def __init__(self, N, p_edge=1.0, seed=42):
-        """
-        Args:
-            N: число узлов
-            p_edge: вероятность ребра между соседями (1.0 = полная цепочка)
-            seed: зерно генератора
-        """
-        self.N = N
-        rng = np.random.default_rng(seed)
-
-        edges = []
-        for i in range(N - 1):
-            if rng.random() < p_edge:
-                edges.append((i, i + 1, 1.0))
-
-        self.edges = edges
-
-        # Лапласиан: L = D - A
-        row, col, data = [], [], []
-        for (i, j, w) in edges:
-            row.extend([i, j, i, j])
-            col.extend([j, i, i, j])
-            data.extend([-w, -w, w, w])
-
-        self.laplacian = sp.csr_matrix(
-            (data, (row, col)), shape=(N, N)
-        )
-Тест — synthetic/tests/test_synthetic.py
-python
-"""Тест synthetic v0.3: граничные условия, устойчивость, сохранение."""
-
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))))
-
-import numpy as np
-from common.graph_utils import Graph
-from synthetic.diffusion import SyntheticBioDiffusion
-
-IONS = [
-    {"name": "Na", "D": 0.01, "z": 1, "c0": 10.0},
-    {"name": "K", "D": 0.02, "z": 1, "c0": 100.0},
-    {"name": "Cl", "D": 0.015, "z": -1, "c0": 110.0},
-]
-
-
-def main():
-    graph = Graph(N=50, p_edge=1.0, seed=42)
-    bio = SyntheticBioDiffusion(graph, IONS, eps=1.0, F_RT=1.0, dt=1e-3)
-
-    Q0 = bio.total_charge()
-    print(f"Bio-COMSOL Synthetic v0.3 — Test")
-    print(f"Graph: {bio.N} nodes, {len(bio.edges)} edges")
-    print(f"Ions: {bio.names}")
-    print(f"Initial charge: {Q0:.6e}")
-    print()
-
-    steps = 500
-    for step in range(steps):
-        bio.step()
-        if step % 100 == 0 or step == steps - 1:
-            Q = bio.total_charge()
-            neg = (bio.c < 0).sum()
-            print(f"Step {step:4d}: Q = {Q:.4e}, "
-                  f"range = [{bio.c.min():.3f}..{bio.c.max():.3f}], "
-                  f"neg = {neg}")
-
-    print()
-    print("=== RESULTS ===")
-    print(f"Final charge:   {bio.total_charge():.6e}")
-    print(f"Dirichlet [0]:   Na={bio.c[0,0]:.4f}, K={bio.c[1,0]:.4f}, "
-          f"Cl={bio.c[2,0]:.4f}")
-    print(f"Conc. range:     {bio.c.min():.4f} .. {bio.c.max():.4f}")
-    print(f"Negative conc.:  {(bio.c < 0).sum()}")
-
-
-if __name__ == "__main__":
-    main()
-# Запуск тестов (из корня репозитория):
-#   python tests/test_bio_diffusion_implicit.py
