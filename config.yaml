@@ -1,5 +1,5 @@
-# config.yaml — Физические константы и параметры модели
-# GAK-001 Bio-Diffusion v0.9
+# config.yaml - Physical constants and model parameters
+# GAK-001 Bio-Diffusion v0.9 (patch v0.7.2)
 
 physics_constants:
   T: 310.0
@@ -9,9 +9,14 @@ physics_constants:
   R: 8.314462618
   F: 96485.33212
   eps0: 8.8541878128e-12
-  RT: 2578.48
+  RT: 2577.48
   F_RT: 37.44
-  thermal_voltage: 0.02569
+  thermal_voltage: 0.02671
+
+units:
+  length: 1.0e-6
+  c_ref: 110.0
+  membrane_potential_V: -0.0481
 
 ion_species:
   Na:
@@ -30,6 +35,10 @@ ion_species:
     D: 0.79e-9
     z: 2
     c0: 1.0
+  Glu:
+    D: 1.0e-9
+    z: -1
+    c0: 41.0
 
 graph:
   N: 20
@@ -45,14 +54,14 @@ solver:
   picard_max_iter: 20
   steady_state_tol: 1.0e-10
   analyze_every: 0
-  self_consistent: false
+  self_consistent: true
   poisson_lambda: 1.0
-  use_newton: false
+  use_newton: true
   newton_tol: 1.0e-8
   newton_max_iter: 5
 
 neuron:
-  enabled: true
+  enabled: false
   neuron_nodes: [5, 10, 15]
   dt: 0.01
   use_nernst: false
@@ -86,4 +95,3 @@ synapse:
 simulation:
   n_steps: 100
   output_every: 10
-# === END ===
