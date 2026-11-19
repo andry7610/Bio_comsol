@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install numpy scipy pytest
+        run: pip install numpy scipy pytest pyyaml
 
       - name: Run tests
         run: python -m pytest tests/ -v
