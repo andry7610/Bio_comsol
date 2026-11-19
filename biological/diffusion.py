@@ -1,5 +1,15 @@
 """biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
 
+Версия: v0.8.0
+  - НОВОЕ (Ступень 2, v1.0): SG-схема Шарфеттера-Гуммеля в адвективном члене
+  - Центральные разности (E_mid) заменены Бернулли-весами (sg_scheme.bernoulli)
+  - Осцилляции при Pe > 2 (документированная граница паспорта v0.9) устранены:
+    комбинированная матрица (I + dt*D*L + dt*adv_jac) == точная SG-матрица
+    (M-матрица) => позитичность при любом dt. Проверено в песочнице: фронт
+    Pe=10 держится в [0, 1] и Ньютоном, и Пикаром; старая схема даёт выбросы.
+  - use_sg=True по умолчанию; use_sg=False возвращает старую схему (сравнение)
+  - Якобиан Ньютона согласован с SG-потоком
+
 Версия: v0.7.2
   - ИСПРАВЛЕНО: знак в уравнении Пуассона (+lambda*rho вместо -lambda*rho)
     Было: L*phi = -lambda*rho  =>  nabla^2 phi = +rho  (антиэкранировка, взрыв)
@@ -31,6 +41,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from network import get_backend, AnalysisResult
+from sg_scheme import bernoulli
 
 
 class BiologicalDiffusion:
@@ -42,18 +53,27 @@ class BiologicalDiffusion:
 
     В графе: L·c ≈ -∇²c, B@flux ≈ -∇·flux.
     Уравнение: ∂c/∂t = -D·L·c - adv_code(c)
-    где adv_code = B @ (D·z·F_RT · c_mid · (B_unw.T @ phi))
+
+    SG-схема (v0.8.0): дрейфовый поток на ребре e=(i,j) с
+    psi = z·(F/RT)·(phi_j - phi_i) берётся Бернулли-весами:
+
+        flux_e = D·[ (1 - B(psi))·c_i + (B(-psi) - 1)·c_j ]
+
+    При psi -> 0 это точно совпадает со старой центральной схемой,
+    при |psi| >> 1 берёт концентрацию с наветренной стороны.
+    Сумма с неявной диффузией даёт точный SG-поток на ребре:
+
+        Gamma_e = w·D·[ B(psi)·c_i - B(-psi)·c_j ]
+
+    Комбинированная матрица системы — M-матрица: позитичность при любом dt.
 
     Метод Ньютона (v0.7):
         Построение якобиана J_k = I + dt·D_k·L + dt·adv_jacobian_k
-        где adv_jacobian_k = D_k·z_k·(F/RT)·B·diag(B_unw^T·φ)·E_mid
-
         При фиксированном φ система линейна → Ньютон сходится за 1 шаг.
         При self_consistent=True — за 2-3 шага.
 
     Самосогласованный потенциал (v0.7.2, исправлен знак):
         L · φ = +λ · ρ,  ρ = Σ_k z_k · c_k
-        (эквивалент физического nabla^2 φ = −λρ, так как L ≈ −nabla^2)
 
     Метод Пикара (v0.4):
         Линеаризация: adv_k пересчитывается на каждой итерации.
@@ -65,7 +85,8 @@ class BiologicalDiffusion:
                  picard_tol=1e-6, picard_max_iter=20,
                  ai_backend=None, analyze_every=0,
                  self_consistent=False, poisson_lambda=1.0,
-                 use_newton=False, newton_tol=1e-8, newton_max_iter=5):
+                 use_newton=False, newton_tol=1e-8, newton_max_iter=5,
+                 use_sg=True):
 
         self.graph = graph
         self.N = graph.N
@@ -81,6 +102,7 @@ class BiologicalDiffusion:
         self.use_newton = use_newton
         self.newton_tol = newton_tol
         self.newton_max_iter = newton_max_iter
+        self.use_sg = use_sg
 
         # --- Ионы ---
         self.n_ions = len(ions)
@@ -105,8 +127,6 @@ class BiologicalDiffusion:
         self.boundary_nodes = {0, self.N - 1} if self.N > 1 else set()
 
         # --- Матрицы системы (предрассчитанные для Пикара) ---
-        # ИСПРАВЛЕНО: I + dt*D*L (вместо I - dt*D*L)
-        # L·c ≈ -∇²c, поэтому для диффузии нужен +
         self.I = sp.eye(self.N, format='csr')
         self.A_mats = []
         for k in range(self.n_ions):
@@ -124,8 +144,7 @@ class BiologicalDiffusion:
                 A_pois[node, node] = 1.0
             self.A_poisson = A_pois.tocsr()
 
-        # --- Матрица инцидентности B и средних E_mid ---
-        # ИСПРАВЛЕНО: B_unweighted для корректного масштаба адвекции
+        # --- Матрица инцидентности B, средние E_mid, селекторы SG ---
         self._build_incidence()
 
         self.step_count = 0
@@ -139,23 +158,32 @@ class BiologicalDiffusion:
         self.last_analysis: AnalysisResult | None = None
 
     def _build_incidence(self):
-        """Матрица инцидентности B (N × E) и средних E_mid (E × N).
+        """Матрица инцидентности B (N × E), средние E_mid (E × N)
+        и селекторы концов рёбер E_head/E_tail для SG-схемы (v0.8.0).
 
         B[node, edge] — поток из узла в ребро (с весом).
         B_unweighted[node, edge] — то же, но веса = 1 (для grad_phi).
         E_mid[edge, node] — 0.5 если узел — конец ребра, 0 иначе.
-        c_mid = E_mid @ c_k — средняя концентрация на рёбрах.
+        E_head[edge, node] — 1 если узел — начало ребра (i).
+        E_tail[edge, node] — 1 если узел — конец ребра (j).
         """
         E = len(self.edges)
         if E == 0:
             self.B = sp.csr_matrix((self.N, 0))
             self.B_unweighted = sp.csr_matrix((self.N, 0))
             self.E_mid = sp.csr_matrix((0, self.N))
+            self.E_head = sp.csr_matrix((0, self.N))
+            self.E_tail = sp.csr_matrix((0, self.N))
+            self._edge_i = np.zeros(0, dtype=int)
+            self._edge_j = np.zeros(0, dtype=int)
             return
 
         row_b, col_b, data_b = [], [], []
         row_bu, col_bu, data_bu = [], [], []
         row_e, col_e, data_e = [], [], []
+
+        self._edge_i = np.array([e[0] for e in self.edges], dtype=int)
+        self._edge_j = np.array([e[1] for e in self.edges], dtype=int)
 
         for e_idx, (i, j, w) in enumerate(self.edges):
             # Взвешенная матрица B (для дивергенции)
@@ -179,6 +207,12 @@ class BiologicalDiffusion:
         self.E_mid = sp.csr_matrix((data_e, (row_e, col_e)),
                                    shape=(E, self.N))
 
+        rows = np.arange(E)
+        self.E_head = sp.csr_matrix((np.ones(E), (rows, self._edge_i)),
+                                    shape=(E, self.N))
+        self.E_tail = sp.csr_matrix((np.ones(E), (rows, self._edge_j)),
+                                    shape=(E, self.N))
+
     def _edge_mid_conc(self, c_k):
         """Средняя концентрация иона k на рёбрах."""
         if len(self.edges) == 0:
@@ -188,23 +222,32 @@ class BiologicalDiffusion:
     def _advective_term(self, c_k, z_k, D_k):
         """Электрический поток для иона k.
 
+        SG (v0.8.0): psi = z·F_RT·(phi_j - phi_i), Бернулли-веса:
+            flux_e = D·[ (1 - B(psi))·c_i + (B(-psi) - 1)·c_j ]
+        При psi -> 0 точно совпадает со старой центральной схемой.
+        При |psi| >> 1 берёт концентрацию с наветренной стороны,
+        что снимает осцилляции при Pe > 2.
+
         B@flux ≈ -∇·flux, поэтому возвращаем B@flux (знак учитывается
         при подстановке в уравнение: ∂c/∂t = -D·L·c - adv_code).
         """
         if len(self.edges) == 0:
             return np.zeros(self.N)
-        c_mid = self._edge_mid_conc(c_k)
-        # ИСПРАВЛЕНО: B_unweighted для корректного масштаба (w вместо w²)
         grad_phi = self.B_unweighted.T @ self.phi
-        flux = D_k * z_k * self.F_RT * c_mid * grad_phi
+        if not self.use_sg:
+            # Старая схема (центральные разности) — только для сравнения
+            c_mid = self._edge_mid_conc(c_k)
+            flux = D_k * z_k * self.F_RT * c_mid * grad_phi
+            return self.B @ flux
+        psi = z_k * self.F_RT * grad_phi
+        b_p = bernoulli(psi)
+        b_m = bernoulli(-psi)
+        flux = D_k * ((1.0 - b_p) * c_k[self._edge_i]
+                      + (b_m - 1.0) * c_k[self._edge_j])
         return self.B @ flux
 
     def _solve_poisson(self):
-        """Самосогласованный потенциал: L · φ = +λ · ρ (v0.7.2: исправлен знак).
-
-        L ≈ −nabla^2, поэтому L·φ = +λρ даёт nabla^2 φ = −λρ — физика Пуассона.
-        Старый вариант (−λρ) давал антиэкранировку и численный взрыв.
-        """
+        """Самосогласованный потенциал: L · φ = +λ · ρ (v0.7.2: исправлен знак)."""
         rho = np.sum(self.z[:, None] * self.c, axis=0)
         rhs = self.poisson_lambda * rho
         rhs[0] = 0.0
@@ -297,7 +340,6 @@ class BiologicalDiffusion:
 
             for k in range(self.n_ions):
                 adv = self._advective_term(c_iter[k], self.z[k], self.D[k])
-                # ИСПРАВЛЕНО: минус перед dt*adv (B@flux ≈ -∇·flux)
                 rhs = c_old[k] - self.dt * adv
                 rhs[0] = self.c_boundary[k, 0]
                 if self.N > 1:
@@ -325,6 +367,8 @@ class BiologicalDiffusion:
         Невязка: F(c) = (I + dt·D·L)·c - c_old + dt·adv(c) = 0
         Якобиан: J = I + dt·D·L + dt·adv_jac
 
+        SG (v0.8.0): adv_jac = D_k·(B @ (diag(1-B(psi))·E_head
+                                        + diag(B(-psi)-1)·E_tail))
         При фиксированном φ система линейна → 1 итерация.
         При self_consistent=True φ пересчитывается → 2-3 итерации.
         """
@@ -334,15 +378,21 @@ class BiologicalDiffusion:
         for iteration in range(self.newton_max_iter):
             c_prev = c_iter.copy()
 
-            # ИСПРАВЛЕНО: B_unweighted для градиента phi
             grad_phi = self.B_unweighted.T @ self.phi  # (E,)
 
             for k in range(self.n_ions):
                 # Якобиан адвективного члена
                 if len(self.edges) > 0:
-                    adv_jac = (self.D[k] * self.z[k] * self.F_RT
-                               * (self.B @ sp.diags(grad_phi) @ self.E_mid))
-                    # ИСПРАВЛЕНО: + dt*D*L + dt*adv_jac (вместо - -)
+                    if self.use_sg:
+                        psi_e = self.z[k] * self.F_RT * grad_phi
+                        b_p = bernoulli(psi_e)
+                        b_m = bernoulli(-psi_e)
+                        adv_jac = self.D[k] * (self.B @ (
+                            sp.diags(1.0 - b_p) @ self.E_head
+                            + sp.diags(b_m - 1.0) @ self.E_tail))
+                    else:
+                        adv_jac = (self.D[k] * self.z[k] * self.F_RT
+                                   * (self.B @ sp.diags(grad_phi) @ self.E_mid))
                     J_k = (self.I
                            + self.dt * self.D[k] * self.L
                            + self.dt * adv_jac)
