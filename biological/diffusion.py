@@ -1,5 +1,15 @@
 """biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
 
+Версия: v0.9.0
+  - НОВОЕ (Ступень 3, v1.0): границы вынесены в атрибуты графа
+  - Граф может нести: node_type = {узел: "boundary"},
+    phi_boundary = {узел: значение phi}, c_boundary = {узел: {ион: значение}}
+  - Модель читает их в __init__; Дирихле ставится в ЛЮБОМ узле, не только 0/N-1
+  - Фолбэк: атрибутов нет -> старое поведение v0.9 (узлы 0 и N-1,
+    c_left/c_right, phi: 0 и phi_membrane). Правка m.c_boundary[:, 0] после
+    конструирования по-прежнему работает (замок обратной совместимости).
+  - Замок равенства: 1D из атрибутов == 1D из индексов (tests/test_boundary_graph.py)
+
 Версия: v0.8.0
   - НОВОЕ (Ступень 2, v1.0): SG-схема Шарфеттера-Гуммеля в адвективном члене
   - Центральные разности (E_mid) заменены Бернулли-весами (sg_scheme.bernoulli)
@@ -123,8 +133,29 @@ class BiologicalDiffusion:
         # --- Потенциал ---
         self.phi = np.linspace(0.0, self.phi_membrane, self.N)
 
-        # --- Граничные узлы ---
-        self.boundary_nodes = {0, self.N - 1} if self.N > 1 else set()
+        # --- Граничные узлы (v0.9.0, Ступень 3: из атрибутов графа) ---
+        node_type = getattr(graph, "node_type", None)
+        if node_type:
+            self.boundary_nodes = {int(n) for n, t in node_type.items()
+                                   if t == "boundary"}
+            phi_b = {int(n): float(v) for n, v in
+                     (getattr(graph, "phi_boundary", None) or {}).items()}
+            self.phi_boundary = {n: phi_b.get(n, self.phi_membrane)
+                                 for n in self.boundary_nodes}
+            c_b_graph = getattr(graph, "c_boundary", None) or {}
+            self._c_boundary_nodes = {}
+            for n in self.boundary_nodes:
+                src = c_b_graph.get(n, {})
+                self._c_boundary_nodes[n] = np.array(
+                    [src.get(self.names[k], self.c0_vals[k])
+                     for k in range(self.n_ions)], dtype=float)
+        else:
+            # Фолбэк v0.9: границы в индексах 0 и N-1 (старое поведение)
+            self.boundary_nodes = {0, self.N - 1} if self.N > 1 else set()
+            self.phi_boundary = {n: (0.0 if n == 0 else self.phi_membrane)
+                                 for n in self.boundary_nodes}
+            self._c_boundary_nodes = {n: ("left" if n == 0 else "right")
+                                      for n in self.boundary_nodes}
 
         # --- Матрицы системы (предрассчитанные для Пикара) ---
         self.I = sp.eye(self.N, format='csr')
@@ -246,13 +277,30 @@ class BiologicalDiffusion:
                       + (b_m - 1.0) * c_k[self._edge_j])
         return self.B @ flux
 
+    def _dirichlet_c_value(self, k, node):
+        """Значение Дирихле для иона k в граничном узле (Ступень 3).
+
+        Фолбэк-узлы ("left"/"right") читают self.c_boundary — как в v0.9:
+        правка массива после конструирования продолжает работать.
+        Узлы из атрибутов графа несут собственные значения; без данных — c0.
+        """
+        src = self._c_boundary_nodes.get(node)
+        if isinstance(src, str):
+            return self.c_boundary[k, 0 if src == "left" else 1]
+        if src is not None:
+            return float(src[k])
+        return float(self.c0_vals[k])
+
     def _solve_poisson(self):
-        """Самосогласованный потенциал: L · φ = +λ · ρ (v0.7.2: исправлен знак)."""
+        """Самосогласованный потенциал: L · φ = +λ · ρ (v0.7.2: исправлен знак).
+
+        Ступень 3: Дирихле на phi берётся из self.phi_boundary
+        ({узел: значение}); в фолбэке это {0: 0.0, N-1: phi_membrane}.
+        """
         rho = np.sum(self.z[:, None] * self.c, axis=0)
         rhs = self.poisson_lambda * rho
-        rhs[0] = 0.0
-        if self.N > 1:
-            rhs[self.N - 1] = self.phi_membrane
+        for node, value in self.phi_boundary.items():
+            rhs[node] = value
         self.phi = spla.spsolve(self.A_poisson, rhs)
 
     # --- Диагностика ---
@@ -341,9 +389,8 @@ class BiologicalDiffusion:
             for k in range(self.n_ions):
                 adv = self._advective_term(c_iter[k], self.z[k], self.D[k])
                 rhs = c_old[k] - self.dt * adv
-                rhs[0] = self.c_boundary[k, 0]
-                if self.N > 1:
-                    rhs[self.N - 1] = self.c_boundary[k, 1]
+                for node in self.boundary_nodes:
+                    rhs[node] = self._dirichlet_c_value(k, node)
                 c_iter[k] = spla.spsolve(self.A_mats[k], rhs)
 
             diff = np.max(np.abs(c_iter - c_prev))
@@ -408,9 +455,8 @@ class BiologicalDiffusion:
 
                 # RHS
                 rhs = c_old[k].copy()
-                rhs[0] = self.c_boundary[k, 0]
-                if self.N > 1:
-                    rhs[self.N - 1] = self.c_boundary[k, 1]
+                for node in self.boundary_nodes:
+                    rhs[node] = self._dirichlet_c_value(k, node)
 
                 c_iter[k] = spla.spsolve(J_k, rhs)
 
