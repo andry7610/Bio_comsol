@@ -1,49 +1,41 @@
 """biological/diffusion.py — Квазинейтральная модель Нернста-Планка.
 
-Версия: v0.9.0
-  - НОВОЕ (Ступень 3, v1.0): границы вынесены в атрибуты графа
-  - Граф может нести: node_type = {узел: "boundary"},
-    phi_boundary = {узел: значение phi}, c_boundary = {узел: {ион: значение}}
-  - Модель читает их в __init__; Дирихле ставится в ЛЮБОМ узле, не только 0/N-1
-  - Фолбэк: атрибутов нет -> старое поведение v0.9 (узлы 0 и N-1,
-    c_left/c_right, phi: 0 и phi_membrane). Правка m.c_boundary[:, 0] после
-    конструирования по-прежнему работает (замок обратной совместимости).
-  - Замок равенства: 1D из атрибутов == 1D из индексов (tests/test_boundary_graph.py)
+Версия: v0.9.3 (фикс CI: защита чтения граф-атрибутов)
+  - node_type с НЕстроковыми значениями (массивы признаков узлов) больше
+    не рушит конструктор: меткой границы считается только строка "boundary".
+  - Если в node_type нет ни одной метки "boundary" — честный фолбэк на
+    легаси-узлы 0 и N-1 (раньше получали пустое множество границ и
+    вырожденную матрицу Пуассона: phi = nan).
+  - c_boundary_graph: значения не-dict (массивы) => c0, без truth-value.
+
+Версия: v0.9.2 (Ступень 4, sparse-Ньютон)
+  - Сборка якобиана Ньютона в CSR без tolil-преобразований в горячем цикле:
+      J_k = A_mats[k] + dt * (S_mask @ adv_jac),
+    где S_mask — предрассчитанная маска внутренних узлов (нули на границах),
+    а строки Дирихле уже зашиты в A_mats (предрассчитаны для Пикара).
+    Граничная строка J_k получается сложением, а не перезаписью через lil.
+  - Исправлено: финальный solve Пуассона после цикла Ньютона —
+    phi теперь согласован с принятыми c (раньше отставал на итерацию).
+  - Замки: sparse-Ньютон == legacy-Ньютон (tolil) до 1e-12,
+    sparse-Ньютон == Пикар (сходимость к одному аттрактору),
+    строки Дирихле якобиана == e_node.
+
+Версия: v0.9.0 (Ступень 3, границы из атрибутов графа)
+  - node_type / phi_boundary / c_boundary читаются из графа;
+    фолбэк — узлы 0 и N-1 со значениями c_left / c_right и phi = 0 / phi_membrane.
+  - Дирихле-границу можно поставить в произвольный узел графа.
 
 Версия: v0.8.0
-  - НОВОЕ (Ступень 2, v1.0): SG-схема Шарфеттера-Гуммеля в адвективном члене
-  - Центральные разности (E_mid) заменены Бернулли-весами (sg_scheme.bernoulli)
-  - Осцилляции при Pe > 2 (документированная граница паспорта v0.9) устранены:
-    комбинированная матрица (I + dt*D*L + dt*adv_jac) == точная SG-матрица
-    (M-матрица) => позитичность при любом dt. Проверено в песочнице: фронт
-    Pe=10 держится в [0, 1] и Ньютоном, и Пикаром; старая схема даёт выбросы.
-  - use_sg=True по умолчанию; use_sg=False возвращает старую схему (сравнение)
-  - Якобиан Ньютона согласован с SG-потоком
+  - SG-схема Шарфеттера-Гуммеля: позитичность при любом dt (Pe > 2 закрыт).
 
 Версия: v0.7.2
-  - ИСПРАВЛЕНО: знак в уравнении Пуассона (+lambda*rho вместо -lambda*rho)
-    Было: L*phi = -lambda*rho  =>  nabla^2 phi = +rho  (антиэкранировка, взрыв)
-    Стало: L*phi = +lambda*rho  =>  nabla^2 phi = -rho  (физика, экранировка)
-
-Версия: v0.7.1
-  - ИСПРАВЛЕНО: знак диффузии (I + dt*D*L вместо I - dt*D*L)
-  - ИСПРАВЛЕНО: масштаб адвекции (B_unweighted для grad_phi, w вместо w²)
-  - ИСПРАВЛЕНО: знак адвекции в Picard и Newton (- dt * adv)
+  - Знак Пуассона: L*phi = +lambda*rho (экранировка).
 
 Версия: v0.7
-  - Метод Ньютона с аналитическим якобианом (use_newton=True)
-  - Квадратичная сходимость: 1-3 итерации вместо 20 у Пикара
-  - Матрица E_mid для точного якобиана адвективного члена
-  - last_iters — общее поле, last_newton_iters — для Ньютона
-
-Версия: v0.6.1
-  - Самосогласованный потенциал из уравнения Пуассона
-
-Версия: v0.5
-  - ИИ-бэкенды, автоанализ
+  - Метод Ньютона с аналитическим якобианом.
 
 Версия: v0.4
-  - Квазинейтральность, 4 иона, Пикар
+  - Квазинейтральность, Пикар.
 """
 
 import numpy as np
@@ -55,40 +47,7 @@ from sg_scheme import bernoulli
 
 
 class BiologicalDiffusion:
-    """Квазинейтральная модель ионного транспорта на графе.
-
-    Уравнение Нернста-Планка для иона k:
-
-        ∂c_k/∂t = D_k · ∇²c_k + D_k · z_k · (F/RT) · ∇(c_k · ∇φ)
-
-    В графе: L·c ≈ -∇²c, B@flux ≈ -∇·flux.
-    Уравнение: ∂c/∂t = -D·L·c - adv_code(c)
-
-    SG-схема (v0.8.0): дрейфовый поток на ребре e=(i,j) с
-    psi = z·(F/RT)·(phi_j - phi_i) берётся Бернулли-весами:
-
-        flux_e = D·[ (1 - B(psi))·c_i + (B(-psi) - 1)·c_j ]
-
-    При psi -> 0 это точно совпадает со старой центральной схемой,
-    при |psi| >> 1 берёт концентрацию с наветренной стороны.
-    Сумма с неявной диффузией даёт точный SG-поток на ребре:
-
-        Gamma_e = w·D·[ B(psi)·c_i - B(-psi)·c_j ]
-
-    Комбинированная матрица системы — M-матрица: позитичность при любом dt.
-
-    Метод Ньютона (v0.7):
-        Построение якобиана J_k = I + dt·D_k·L + dt·adv_jacobian_k
-        При фиксированном φ система линейна → Ньютон сходится за 1 шаг.
-        При self_consistent=True — за 2-3 шага.
-
-    Самосогласованный потенциал (v0.7.2, исправлен знак):
-        L · φ = +λ · ρ,  ρ = Σ_k z_k · c_k
-
-    Метод Пикара (v0.4):
-        Линеаризация: adv_k пересчитывается на каждой итерации.
-        Линейная сходимость, ~20 итераций.
-    """
+    """Квазинейтральная модель ионного транспорта на графе."""
 
     def __init__(self, graph, ions, dt=1e-3, F_RT=1.0,
                  membrane_potential=-1.8,
@@ -124,7 +83,7 @@ class BiologicalDiffusion:
         # Концентрации (n_ions, N)
         self.c = np.tile(self.c0_vals.reshape(-1, 1), (1, self.N))
 
-        # Граничные концентрации (Дирихле «ванна»)
+        # Граничные концентрации (Дирихле "ванна", фолбэк)
         self.c_boundary = np.zeros((self.n_ions, 2))
         for k, ion in enumerate(ions):
             self.c_boundary[k, 0] = ion.get("c_left", ion["c0"])
@@ -133,31 +92,36 @@ class BiologicalDiffusion:
         # --- Потенциал ---
         self.phi = np.linspace(0.0, self.phi_membrane, self.N)
 
-        # --- Граничные узлы (v0.9.0, Ступень 3: из атрибутов графа) ---
-        node_type = getattr(graph, "node_type", None)
-        if node_type:
-            self.boundary_nodes = {int(n) for n, t in node_type.items()
-                                   if t == "boundary"}
-            phi_b = {int(n): float(v) for n, v in
-                     (getattr(graph, "phi_boundary", None) or {}).items()}
-            self.phi_boundary = {n: phi_b.get(n, self.phi_membrane)
-                                 for n in self.boundary_nodes}
-            c_b_graph = getattr(graph, "c_boundary", None) or {}
-            self._c_boundary_nodes = {}
-            for n in self.boundary_nodes:
-                src = c_b_graph.get(n, {})
-                self._c_boundary_nodes[n] = np.array(
-                    [src.get(self.names[k], self.c0_vals[k])
-                     for k in range(self.n_ions)], dtype=float)
-        else:
-            # Фолбэк v0.9: границы в индексах 0 и N-1 (старое поведение)
+        # --- Граничные узлы: атрибуты графа (Ступень 3) или фолбэк ---
+        node_types = getattr(graph, "node_type", None)
+        phi_b = getattr(graph, "phi_boundary", None)
+        c_b = getattr(graph, "c_boundary", None)
+        self._has_graph_bounds = isinstance(node_types, dict) and len(node_types) > 0
+        if self._has_graph_bounds:
+            # v0.9.3: защита от нестроковых значений в node_type.
+            # Словарь node_type может нести признаки узлов (массивы) —
+            # сравнение массива со строкой запрещено numpy. Меткой границы
+            # считается только строка "boundary" (np.str_ тоже строка).
+            self.boundary_nodes = set()
+            for n, t in node_types.items():
+                if isinstance(t, str) and t == "boundary":
+                    self.boundary_nodes.add(n)
+            self.phi_boundary = dict(phi_b) if isinstance(phi_b, dict) else {}
+            self.c_boundary_graph = dict(c_b) if isinstance(c_b, dict) else {}
+            if not self.boundary_nodes:
+                # Словарь node_type есть, но меток "boundary" в нём нет —
+                # это не разметка границ. Честный фолбэк на легаси-узлы
+                # 0 и N-1 (иначе матрица Пуассона вырождена).
+                self._has_graph_bounds = False
+        if not self._has_graph_bounds:
             self.boundary_nodes = {0, self.N - 1} if self.N > 1 else set()
-            self.phi_boundary = {n: (0.0 if n == 0 else self.phi_membrane)
-                                 for n in self.boundary_nodes}
-            self._c_boundary_nodes = {n: ("left" if n == 0 else "right")
-                                      for n in self.boundary_nodes}
+            self.phi_boundary = {0: 0.0}
+            if self.N > 1:
+                self.phi_boundary[self.N - 1] = self.phi_membrane
+            self.c_boundary_graph = {}
 
-        # --- Матрицы системы (предрассчитанные для Пикара) ---
+        # --- Матрицы системы (предрассчитанные для Пикара; строки Дирихле
+        #     переиспользуются Ньютоном в v0.9.2) ---
         self.I = sp.eye(self.N, format='csr')
         self.A_mats = []
         for k in range(self.n_ions):
@@ -178,6 +142,12 @@ class BiologicalDiffusion:
         # --- Матрица инцидентности B, средние E_mid, селекторы SG ---
         self._build_incidence()
 
+        # --- Маска внутренних узлов для sparse-сборки якобиана (v0.9.2) ---
+        mask = np.ones(self.N)
+        for node in self.boundary_nodes:
+            mask[node] = 0.0
+        self._interior_mask = sp.diags(mask, format='csr')
+
         self.step_count = 0
         self.last_picard_iters = 0
         self.last_newton_iters = 0
@@ -188,16 +158,35 @@ class BiologicalDiffusion:
         self.analyze_every = analyze_every
         self.last_analysis: AnalysisResult | None = None
 
-    def _build_incidence(self):
-        """Матрица инцидентности B (N × E), средние E_mid (E × N)
-        и селекторы концов рёбер E_head/E_tail для SG-схемы (v0.8.0).
+    def _dirichlet_c_value(self, k, node):
+        """Значение Дирихле для иона k в узле node (Ступень 3).
 
-        B[node, edge] — поток из узла в ребро (с весом).
-        B_unweighted[node, edge] — то же, но веса = 1 (для grad_phi).
-        E_mid[edge, node] — 0.5 если узел — конец ребра, 0 иначе.
-        E_head[edge, node] — 1 если узел — начало ребра (i).
-        E_tail[edge, node] — 1 если узел — конец ребра (j).
+        Графовые атрибуты > строковые ссылки на ванну > c0.
         """
+        if self._has_graph_bounds:
+            spec = self.c_boundary_graph.get(node)
+            # v0.9.3: только dict-спека без truth-value на массивах;
+            # значения-массивы (признаки узлов) игнорируются => c0.
+            if not isinstance(spec, dict) or len(spec) == 0:
+                return self.c0_vals[k]
+            val = spec.get(self.names[k])
+            if val is None:
+                return self.c0_vals[k]
+            if isinstance(val, str):
+                if val == "left":
+                    return float(self.c_boundary[k, 0])
+                if val == "right":
+                    return float(self.c_boundary[k, 1])
+                raise ValueError("unknown c_boundary spec: %r" % (val,))
+            return float(val)
+        if node in self.boundary_nodes:
+            if node == min(self.boundary_nodes):
+                return float(self.c_boundary[k, 0])
+            return float(self.c_boundary[k, 1])
+        return self.c0_vals[k]
+
+    def _build_incidence(self):
+        """Матрица инцидентности B, средние E_mid, селекторы SG."""
         E = len(self.edges)
         if E == 0:
             self.B = sp.csr_matrix((self.N, 0))
@@ -217,12 +206,10 @@ class BiologicalDiffusion:
         self._edge_j = np.array([e[1] for e in self.edges], dtype=int)
 
         for e_idx, (i, j, w) in enumerate(self.edges):
-            # Взвешенная матрица B (для дивергенции)
             row_b.extend([i, j])
             col_b.extend([e_idx, e_idx])
             data_b.extend([-w, w])
 
-            # Невзвешенная матрица B_unweighted (для градиента phi)
             row_bu.extend([i, j])
             col_bu.extend([e_idx, e_idx])
             data_bu.extend([-1.0, 1.0])
@@ -231,12 +218,10 @@ class BiologicalDiffusion:
             col_e.extend([i, j])
             data_e.extend([0.5, 0.5])
 
-        self.B = sp.csr_matrix((data_b, (row_b, col_b)),
-                              shape=(self.N, E))
+        self.B = sp.csr_matrix((data_b, (row_b, col_b)), shape=(self.N, E))
         self.B_unweighted = sp.csr_matrix((data_bu, (row_bu, col_bu)),
                                           shape=(self.N, E))
-        self.E_mid = sp.csr_matrix((data_e, (row_e, col_e)),
-                                   shape=(E, self.N))
+        self.E_mid = sp.csr_matrix((data_e, (row_e, col_e)), shape=(E, self.N))
 
         rows = np.arange(E)
         self.E_head = sp.csr_matrix((np.ones(E), (rows, self._edge_i)),
@@ -245,28 +230,15 @@ class BiologicalDiffusion:
                                     shape=(E, self.N))
 
     def _edge_mid_conc(self, c_k):
-        """Средняя концентрация иона k на рёбрах."""
         if len(self.edges) == 0:
             return np.zeros(0)
         return self.E_mid @ c_k
 
     def _advective_term(self, c_k, z_k, D_k):
-        """Электрический поток для иона k.
-
-        SG (v0.8.0): psi = z·F_RT·(phi_j - phi_i), Бернулли-веса:
-            flux_e = D·[ (1 - B(psi))·c_i + (B(-psi) - 1)·c_j ]
-        При psi -> 0 точно совпадает со старой центральной схемой.
-        При |psi| >> 1 берёт концентрацию с наветренной стороны,
-        что снимает осцилляции при Pe > 2.
-
-        B@flux ≈ -∇·flux, поэтому возвращаем B@flux (знак учитывается
-        при подстановке в уравнение: ∂c/∂t = -D·L·c - adv_code).
-        """
         if len(self.edges) == 0:
             return np.zeros(self.N)
         grad_phi = self.B_unweighted.T @ self.phi
         if not self.use_sg:
-            # Старая схема (центральные разности) — только для сравнения
             c_mid = self._edge_mid_conc(c_k)
             flux = D_k * z_k * self.F_RT * c_mid * grad_phi
             return self.B @ flux
@@ -277,30 +249,12 @@ class BiologicalDiffusion:
                       + (b_m - 1.0) * c_k[self._edge_j])
         return self.B @ flux
 
-    def _dirichlet_c_value(self, k, node):
-        """Значение Дирихле для иона k в граничном узле (Ступень 3).
-
-        Фолбэк-узлы ("left"/"right") читают self.c_boundary — как в v0.9:
-        правка массива после конструирования продолжает работать.
-        Узлы из атрибутов графа несут собственные значения; без данных — c0.
-        """
-        src = self._c_boundary_nodes.get(node)
-        if isinstance(src, str):
-            return self.c_boundary[k, 0 if src == "left" else 1]
-        if src is not None:
-            return float(src[k])
-        return float(self.c0_vals[k])
-
     def _solve_poisson(self):
-        """Самосогласованный потенциал: L · φ = +λ · ρ (v0.7.2: исправлен знак).
-
-        Ступень 3: Дирихле на phi берётся из self.phi_boundary
-        ({узел: значение}); в фолбэке это {0: 0.0, N-1: phi_membrane}.
-        """
+        """Самосогласованный потенциал: L * phi = +lambda * rho."""
         rho = np.sum(self.z[:, None] * self.c, axis=0)
         rhs = self.poisson_lambda * rho
-        for node, value in self.phi_boundary.items():
-            rhs[node] = value
+        for node in self.boundary_nodes:
+            rhs[node] = self.phi_boundary.get(node, 0.0)
         self.phi = spla.spsolve(self.A_poisson, rhs)
 
     # --- Диагностика ---
@@ -360,11 +314,6 @@ class BiologicalDiffusion:
     # --- Шаг по времени ---
 
     def step(self):
-        """Один шаг по времени.
-
-        use_newton=True → метод Ньютона (квадратичная сходимость).
-        use_newton=False → итерации Пикара (линейная сходимость).
-        """
         if self.use_newton:
             iters = self._step_newton()
         else:
@@ -376,10 +325,7 @@ class BiologicalDiffusion:
         return iters
 
     def _step_picard(self):
-        """Шаг Пикара: backward Euler + итерации фиксированной точки.
-
-        Уравнение: (I + dt·D·L)·c_new = c_old - dt·adv(c_iter)
-        """
+        """Шаг Пикара: backward Euler + итерации фиксированной точки."""
         c_old = self.c.copy()
         c_iter = c_old.copy()
 
@@ -407,18 +353,30 @@ class BiologicalDiffusion:
 
         return self.last_picard_iters
 
-    def _step_newton(self):
-        """Шаг Ньютона: backward Euler + аналитический якобиан.
+    def _newton_jacobian(self, k, grad_phi):
+        """Якобиан иона k (v0.9.2: чисто CSR, без tolil в цикле).
 
-        Уравнение: (I + dt·D·L)·c_new = c_old - dt·adv(c_new)
-        Невязка: F(c) = (I + dt·D·L)·c - c_old + dt·adv(c) = 0
-        Якобиан: J = I + dt·D·L + dt·adv_jac
-
-        SG (v0.8.0): adv_jac = D_k·(B @ (diag(1-B(psi))·E_head
-                                        + diag(B(-psi)-1)·E_tail))
-        При фиксированном φ система линейна → 1 итерация.
-        При self_consistent=True φ пересчитывается → 2-3 итерации.
+        J_k = A_mats[k] + dt * (S_mask @ adv_jac).
+        Строки Дирихле уже сидят в A_mats[k] (идентичность на границах),
+        S_mask обнуляет граничные строки adv_jac — сумма даёт ровно то,
+        что раньше делалось через tolil-перезапись.
         """
+        if len(self.edges) > 0:
+            if self.use_sg:
+                psi_e = self.z[k] * self.F_RT * grad_phi
+                b_p = bernoulli(psi_e)
+                b_m = bernoulli(-psi_e)
+                adv_jac = self.D[k] * (self.B @ (
+                    sp.diags(1.0 - b_p) @ self.E_head
+                    + sp.diags(b_m - 1.0) @ self.E_tail))
+            else:
+                adv_jac = (self.D[k] * self.z[k] * self.F_RT
+                           * (self.B @ sp.diags(grad_phi) @ self.E_mid))
+            return self.A_mats[k] + self.dt * (self._interior_mask @ adv_jac)
+        return self.A_mats[k]
+
+    def _step_newton(self):
+        """Шаг Ньютона: backward Euler + аналитический якобиан (v0.9.2)."""
         c_old = self.c.copy()
         c_iter = c_old.copy()
 
@@ -428,43 +386,17 @@ class BiologicalDiffusion:
             grad_phi = self.B_unweighted.T @ self.phi  # (E,)
 
             for k in range(self.n_ions):
-                # Якобиан адвективного члена
-                if len(self.edges) > 0:
-                    if self.use_sg:
-                        psi_e = self.z[k] * self.F_RT * grad_phi
-                        b_p = bernoulli(psi_e)
-                        b_m = bernoulli(-psi_e)
-                        adv_jac = self.D[k] * (self.B @ (
-                            sp.diags(1.0 - b_p) @ self.E_head
-                            + sp.diags(b_m - 1.0) @ self.E_tail))
-                    else:
-                        adv_jac = (self.D[k] * self.z[k] * self.F_RT
-                                   * (self.B @ sp.diags(grad_phi) @ self.E_mid))
-                    J_k = (self.I
-                           + self.dt * self.D[k] * self.L
-                           + self.dt * adv_jac)
-                else:
-                    J_k = self.I + self.dt * self.D[k] * self.L
+                J_k = self._newton_jacobian(k, grad_phi)
 
-                # Граничные условия Дирихле
-                J_k = J_k.tolil()
-                for node in self.boundary_nodes:
-                    J_k[node, :] = 0
-                    J_k[node, node] = 1.0
-                J_k = J_k.tocsr()
-
-                # RHS
                 rhs = c_old[k].copy()
                 for node in self.boundary_nodes:
                     rhs[node] = self._dirichlet_c_value(k, node)
 
                 c_iter[k] = spla.spsolve(J_k, rhs)
 
-            # Самосогласованный потенциал (внутри цикла!)
             if self.self_consistent:
                 self._solve_poisson()
 
-            # Проверка сходимости Ньютона
             diff = np.max(np.abs(c_iter - c_prev))
             if diff < self.newton_tol:
                 break
@@ -473,5 +405,11 @@ class BiologicalDiffusion:
         self.step_count += 1
         self.last_newton_iters = iteration + 1
         self.last_iters = self.last_newton_iters
+
+        # Финальное согласование phi с принятыми концентрациями (v0.9.2):
+        # внутри цикла solve Пуассона использует ещё не присвоенный self.c,
+        # поэтому без этого solve phi отстаёт на одну итерацию.
+        if self.self_consistent:
+            self._solve_poisson()
 
         return self.last_newton_iters
