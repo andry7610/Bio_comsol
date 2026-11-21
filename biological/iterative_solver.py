@@ -1,135 +1,133 @@
-
-"""Итерационный солвер: CG+SSOR (SPD), BiCGSTAB+ILU (несимметричные),
-решение Дирихле через двустороннюю элиминацию A_pin = P A P + B.
-
-auto-предобуславливатель: SSOR до SSOR_NODE_LIMIT узлов, дальше Жакоби.
-"""
-
+"""Iterative solvers: CG (SSOR/Jacobi) and BiCGSTAB (ILU/Jacobi)."""
 import numpy as np
 import scipy.sparse as sp
-import scipy.sparse.linalg as spla
+from scipy.sparse.linalg import cg, bicgstab, spsolve, splu, spilu, LinearOperator
 
 SSOR_NODE_LIMIT = 40000
 
 
-def _ssor_pre(A, omega=1.0):
-    n = A.shape[0]
-    D = A.diagonal()
-    L = sp.tril(A, k=-1).tocsr()
-    U = sp.triu(A, k=1).tocsr()
-    LU1 = spla.splu((L + sp.diags(D)).tocsc())
-    LU2 = spla.splu((omega * U + sp.diags(D)).tocsc())  # D + omega*U: верхний треугольник!
+def _split(L):
+    A = sp.csr_matrix(L)
+    D = sp.diags(A.diagonal(), format="csr")
+    Z = (A - D).tocsr()
+    Z.eliminate_zeros()
+    r, c = Z.nonzero()
+    up = c > r
+    lo = c < r
+    U = sp.csr_matrix((Z.data[up], (r[up], c[up])), shape=Z.shape)
+    Lo = sp.csr_matrix((Z.data[lo], (r[lo], c[lo])), shape=Z.shape)
+    return D, Lo, U
 
-    def mv(r):
-        z1 = LU1.solve(r)
-        z2 = LU2.solve(z1)
-        return (1.0 - omega) * r + omega * z2
 
-    return spla.LinearOperator((n, n), matvec=mv, dtype=A.dtype)
+def _ssor_pre(L, omega=1.0):
+    """M = (1/w)(D+wL) D^-1 (D+wU);  M^-1 v = w (D+wU)^-1 D (D+wL)^-1 v."""
+    D, Lo, U = _split(L)
+    lu_lo = splu((D + omega * Lo).tocsc())
+    lu_up = splu((D + omega * U).tocsc())
+    ddiag = D.diagonal()
+
+    def mv(v):
+        t = lu_lo.solve(np.asarray(v, dtype=np.float64))
+        t = ddiag * t
+        t = lu_up.solve(t)
+        return omega * t
+
+    return LinearOperator(L.shape, matvec=mv, dtype=np.float64)
+
+
+def _ilu_pre(A, drop_tol=1e-4, fill_factor=10):
+    ilu = spilu(A.tocsc(), drop_tol=drop_tol, fill_factor=fill_factor)
+    return LinearOperator(A.shape, matvec=ilu.solve, dtype=np.float64)
 
 
 def _jacobi_pre(A):
-    n = A.shape[0]
     d = A.diagonal()
-    if np.any(np.abs(d) < 1e-300):
-        raise ValueError("zero diagonal: jacobi preconditioner undefined")
-    return spla.LinearOperator((n, n), matvec=lambda r: r / d, dtype=A.dtype)
+    d = np.where(np.abs(d) > 0, 1.0 / d, 1.0)
+
+    def mv(v):
+        return d * np.asarray(v, dtype=np.float64)
+
+    return LinearOperator(A.shape, matvec=mv, dtype=np.float64)
 
 
-def _ilu_pre(A):
-    ilu = spla.spilu(A.tocsc())
+def _make_pre(A, method, preconditioner):
     n = A.shape[0]
-    return spla.LinearOperator((n, n), matvec=ilu.solve, dtype=A.dtype)
-
-
-def solve_iterative(A, b, method="cg", preconditioner="none", tol=None,
-                    rtol=None, maxiter=10000):
-    """method: cg | bicgstab. preconditioner: none | jacobi | ssor | ilu | auto.
-
-    Совместимость: параметр может прийти как tol=... или rtol=..."""
-    if rtol is None:
-        rtol = tol if tol is not None else 1e-10
-    A = sp.csr_matrix(A)
-    b = np.asarray(b, dtype=float)
-    n = A.shape[0]
-
-    if method not in ("cg", "bicgstab"):
-        raise ValueError(f"unknown method: {method!r}")
-
-    if preconditioner == "auto":
-        preconditioner = "ssor" if n <= SSOR_NODE_LIMIT else "jacobi"
-
+    p = preconditioner
+    if p in (None, "none"):
+        return None
+    p = p.lower()
     if method == "cg":
-        if not _is_symmetric(A):
-            raise ValueError("CG requires symmetric matrix")
-        if preconditioner == "ilu":
-            raise ValueError("ILU is unsymmetric: use CG with ssor/jacobi")
-        pre = {
-            "none": None,
-            "jacobi": lambda: _jacobi_pre(A),
-            "ssor": lambda: _ssor_pre(A),
-        }[preconditioner]()
-        counter = {"n": 0}
-        x, info = spla.cg(A, b, M=pre, rtol=rtol, maxiter=maxiter,
-                          callback=lambda xk: counter.__setitem__("n", counter["n"] + 1))
+        allowed = ("ssor", "jacobi", "auto")
     else:
-        if preconditioner not in ("none", "jacobi", "ilu", "auto"):
-            raise ValueError(f"unknown preconditioner: {preconditioner!r}")
-        pre = {
-            "none": None,
-            "jacobi": lambda: _jacobi_pre(A),
-            "ilu": lambda: _ilu_pre(A),
-        }[preconditioner]()
-        counter = {"n": 0}
-        x, info = spla.bicgstab(A, b, M=pre, rtol=rtol, maxiter=maxiter,
-                                callback=lambda xk: counter.__setitem__("n", counter["n"] + 1))
-
-    if info != 0:
-        raise RuntimeError(f"solver did not converge, info={info}")
-    res = np.linalg.norm(b - A @ x) / max(np.linalg.norm(b), 1e-300)
-    return x, {"iterations": counter["n"], "residual": res,
-               "method": method, "preconditioner": preconditioner}
+        allowed = ("ilu", "jacobi", "auto")
+    if p not in allowed:
+        raise ValueError(
+            f"preconditioner {preconditioner!r} is not allowed for {method!r}; "
+            f"allowed: {allowed}"
+        )
+    if p == "auto":
+        p = "ssor" if (method == "cg" and n <= SSOR_NODE_LIMIT) else (
+            "ilu" if (method == "bicgstab" and n <= SSOR_NODE_LIMIT) else "jacobi")
+    if p == "ssor":
+        return _ssor_pre(A)
+    if p == "ilu":
+        return _ilu_pre(A)
+    return _jacobi_pre(A)
 
 
-def _is_symmetric(A, tol=1e-12):
-    As = abs(A - A.T)
-    return As.nnz == 0 or np.abs(As.data).max() < tol
+def solve_iterative(A, b, method="cg", preconditioner="auto",
+                    tol=1e-10, rtol=None, maxiter=None):
+    """Solve A x = b iteratively. tol and rtol are aliases; stats keys
+    'iters'/'iterations' are aliases too."""
+    if rtol is not None:
+        tol = rtol
+    method = str(method).lower()
+    if method not in ("cg", "bicgstab"):
+        raise ValueError(f"unknown method {method!r}; allowed: 'cg', 'bicgstab'")
+    A = sp.csr_matrix(A, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    M = _make_pre(A, method, preconditioner)
+    stats = {"iters": 0, "iterations": 0, "residual": None,
+             "info": None, "method": method, "preconditioner": preconditioner}
+
+    def cb(xk):
+        stats["iters"] += 1
+
+    solver = cg if method == "cg" else bicgstab
+    x, info = solver(A, b, M=M, rtol=tol,
+                     maxiter=maxiter if maxiter is not None else 10 * A.shape[0],
+                     callback=cb)
+    stats["iters"] = int(stats["iters"])
+    stats["iterations"] = stats["iters"]
+    stats["info"] = int(info)
+    res = np.linalg.norm(A @ x - b)
+    nb = np.linalg.norm(b)
+    stats["residual"] = float(res / nb) if nb > 0 else float(res)
+    return x, stats
 
 
 def solve_direct(A, b):
-    return spla.spsolve(sp.csr_matrix(A), np.asarray(b, dtype=float))
+    return spsolve(sp.csr_matrix(A, dtype=np.float64),
+                   np.asarray(b, dtype=np.float64))
 
 
-def pin_dirichlet(L, pins, values):
-    """Двусторонняя элиминация: строки И столбцы пинов заземляются,
-    диагональ пинов = 1 (симметрия сохраняется).
-
-    Внимание: правую часть корректно собирает dirichlet_system."""
-    L = sp.csr_matrix(L)
-    n = L.shape[0]
+def dirichlet_system(L, pins, values, b):
+    """Dirichlet elimination that keeps symmetry: zero rows AND columns of
+    pins, unit diagonal on pins, rhs adjusted: b_i -= sum_{j in pins} L_ij v_j,
+    and b_pin = values."""
+    A0 = sp.csr_matrix(L, dtype=np.float64)
     pins = np.asarray(pins, dtype=int)
-    values = np.asarray(values, dtype=float)
-    keep = np.ones(n, dtype=bool)
-    keep[pins] = False
-    P = sp.eye(n, format="csr").multiply(keep[:, None])
-    A = (P @ L @ P).tocsr()
-    B = sp.eye(n, format="csr") - P
-    A = A + B  # на пинах A_ii = 1
-    return A
-
-
-def dirichlet_system(L, pins, values, b=None):
-    """Возвращает (A_pin, b_pin) корректной системы после элиминации:
-    строки и столбцы пинов заземлены, b_pin = b - L[:, pins] @ values."""
-    L = sp.csr_matrix(L)
-    n = L.shape[0]
-    pins = np.asarray(pins, dtype=int)
-    values = np.asarray(values, dtype=float)
-    A = pin_dirichlet(L, pins, values)
-    if b is None:
-        b = np.zeros(n)
-    b = np.asarray(b, dtype=float).copy()
-    col = sp.csr_matrix(L)[:, pins] @ values
-    b_pin = b - col
-    b_pin[pins] = values  # строка A_pin i: 1*x_i = value
+    values = np.asarray(values, dtype=np.float64)
+    coo = A0.tocoo()
+    keep = ~np.isin(coo.row, pins) & ~np.isin(coo.col, pins)
+    A = sp.csr_matrix((coo.data[keep], (coo.row[keep], coo.col[keep])),
+                      shape=A0.shape)
+    e = np.zeros(A0.shape[0])
+    e[pins] = 1.0
+    A = A + sp.diags(e, format="csr")
+    b_pin = np.asarray(b, dtype=np.float64).copy()
+    contrib = A0[:, pins] @ values
+    interior = ~np.isin(np.arange(A0.shape[0]), pins)
+    b_pin[interior] -= contrib[interior]
+    b_pin[pins] = values
     return A, b_pin
