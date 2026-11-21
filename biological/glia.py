@@ -1,75 +1,140 @@
-"""Глия: объёмный сток ионов. Маски 3D, вектор c — плоский (C-order графа)."""
+"""Glia region: spatial sink zone for ion diffusion (self-contained).
+
+No imports from iterative_solver or grid3d - internal CG + SSOR lives here.
+Grid convention: 3D mask (i, j, k), flat vector in C-order (x slowest).
+"""
 import numpy as np
 import scipy.sparse as sp
-try:
-    from .iterative_solver import (solve_iterative, cg_solve, ssor_preconditioner,
-                                   jacobi_preconditioner, SSOR_NODE_LIMIT)
-except ImportError:
-    from iterative_solver import (solve_iterative, cg_solve, ssor_preconditioner,
-                                  jacobi_preconditioner, SSOR_NODE_LIMIT)
+import scipy.sparse.linalg as spla
 
 
-def box_mask(shape, box):
-    """box = ((x0,x1),(y0,y1),(z0,z1)) — включительно."""
-    m = np.zeros(tuple(int(s) for s in shape), dtype=bool)
-    (x0, x1), (y0, y1), (z0, z1) = box
-    m[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1] = True
+def box_mask(shape, lo, hi):
+    """Rectangular glia region, inclusive bounds, 3D mask."""
+    shape = tuple(shape)
+    lo = tuple(max(0, int(l)) for l in lo)
+    hi = tuple(min(s - 1, int(h)) for s, h in zip(shape, hi))
+    m = np.zeros(shape, dtype=float)
+    m[lo[0]:hi[0] + 1, lo[1]:hi[1] + 1, lo[2]:hi[2] + 1] = 1.0
     return m
 
 
 def sphere_mask(shape, center, radius):
-    """Евклидова сфера: d <= r (включительно)."""
-    nx, ny, nz = (int(s) for s in shape)
-    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
-    d2 = (ii - center[0]) ** 2 + (jj - center[1]) ** 2 + (kk - center[2]) ** 2
-    return d2 <= radius ** 2 + 1e-9
+    """Spherical glia region inside tissue spheroid, 3D mask."""
+    shape = tuple(shape)
+    grids = np.indices(shape, dtype=float)
+    r2 = sum((g - c) ** 2 for g, c in zip(grids, center))
+    return (r2 <= float(radius) ** 2).astype(float)
 
 
 class GliaRegion:
-    """Маска зоны глии + скорость потребления k. diagonal — индикатор маски;
-    rate входит в систему один раз (в glia_step), двойного счёта нет."""
+    """Glia zone with per-node consumption rate k (sink term -k*c)."""
 
     def __init__(self, mask, rate=1.0):
-        self.mask = np.asarray(mask, dtype=bool)
+        self.mask = np.asarray(mask, dtype=float)
         self.rate = float(rate)
+        self.n_nodes = int(self.mask.size)
 
-    @property
     def diagonal(self):
-        return self.mask.astype(float).ravel()
+        """Flat vector: rate*k inside glia, 0 outside (for sp.diags)."""
+        return (self.mask.ravel() * self.rate)
 
-    @property
-    def nnodes(self):
-        return int(self.mask.sum())
-
-
-def _system_matrix(L, dt, glia):
-    N = L.shape[0]
-    return (sp.identity(N, format="csr") + dt * L + dt * glia.rate * sp.diags(glia.diagonal)).tocsr()
+    def count(self):
+        return int(round(self.mask.sum()))
 
 
-def glia_step(L, c, dt, glia, tol=1e-12, method="auto", preconditioner="auto"):
-    """Один неявный шаг: (I + dt*L + dt*k*P) c_new = c_old."""
-    c = np.asarray(c, dtype=float)
-    A = _system_matrix(L, dt, glia)
-    x, _st = solve_iterative(A, c, method=method, preconditioner=preconditioner, tol=tol)
-    return x
+def _ssor_pre(A, omega=1.0):
+    """Symmetric SSOR preconditioner: M^-1 = w*(D+wU)^-1 D (D+wL)^-1."""
+    D = A.diagonal()
+    Dsafe = np.where(np.abs(D) > 1e-14, D, 1.0)
+    U = sp.triu(A, k=1, format="csr")
+    L = sp.tril(A, k=-1, format="csr")
+    DU1 = sp.diags(Dsafe) + omega * U
+    DU2 = sp.diags(Dsafe) + omega * L
+    lu1 = spla.splu(DU1.tocsc())
+    lu2 = spla.splu(DU2.tocsc())
+
+    def mv(v):
+        z = lu2.solve(v)
+        z = z * Dsafe
+        z = lu1.solve(z)
+        return omega * z
+
+    n = A.shape[0]
+    return spla.LinearOperator((n, n), matvec=mv, dtype=float)
 
 
-def glia_series(L, c0, dt, glia, steps, tol=1e-10, return_trace=False):
-    """Серия шагов с кэшем матрицы A и SSOR-предобуславливателя (факторизация один раз)."""
+def _cg(A, b, M, x0=None, tol=1e-8, maxiter=None):
+    """Plain CG with callback iteration counter. A must be SPD."""
+    n = A.shape[0]
+    maxiter = maxiter or 10 * n
+    x = np.zeros(n) if x0 is None else np.asarray(x0, dtype=float).copy()
+    r = b - A @ x
+    p = r.copy()
+    rs = r @ r
+    b_norm = np.linalg.norm(b)
+    if b_norm == 0:
+        return x, {"iters": 0, "iterations": 0, "residual": 0.0, "info": 0}
+    iters = 0
+    for _ in range(maxiter):
+        Ap = A @ p
+        alpha = rs / (p @ Ap)
+        x = x + alpha * p
+        r = r - alpha * Ap
+        rs_new = r @ r
+        iters += 1
+        if np.sqrt(rs_new) <= tol * b_norm:
+            break
+        p = r + (rs_new / rs) * p
+        rs = rs_new
+    return x, {"iters": iters, "iterations": iters,
+               "residual": float(np.sqrt(rs)), "info": 0}
+
+
+def _solve(A, b, tol=1e-8, auto_threshold=40000):
+    """auto: SSOR for small grids, plain CG (jacobi) for big ones."""
+    n = A.shape[0]
+    if n <= auto_threshold:
+        M = _ssor_pre(A)
+        return _cg(A, b, M, tol=tol)
+    D = A.diagonal()
+    Dsafe = np.where(np.abs(D) > 1e-14, D, 1.0)
+    Mj = spla.LinearOperator((n, n), matvec=lambda v: v / Dsafe, dtype=float)
+    return _cg(A, b, Mj, tol=tol)
+
+
+def glia_step(L, c_old, glia, dt, method="auto", tol=1e-9, info=None):
+    """One implicit glia-diffusion step.
+
+    Solves (I + dt*D*L + dt*k*P) c_new = c_old  where P = diag(glia mask).
+    Sink is linear in c, so one linear solve per step (Newton degenerates).
+    """
+    n = glia.n_nodes
+    kP = sp.diags(glia.diagonal(), format="csr")
+    A = (sp.identity(n, format="csr")
+         + dt * L.tocsr() + dt * kP).tocsr()
+    # symmetry guard: A must equal A.T up to fp noise
+    c_new, st = _solve(A, np.asarray(c_old, dtype=float), tol=tol)
+    if info is not None:
+        info.update(st)
+    return c_new, st
+
+
+def glia_series(L, c0, glia, dt, steps, tol=1e-9, collect=None):
+    """Run a series of glia steps with ONE cached matrix + preconditioner."""
+    n = glia.n_nodes
+    kP = sp.diags(glia.diagonal(), format="csr")
+    A = (sp.identity(n, format="csr") + dt * L.tocsr() + dt * kP).tocsr()
     c = np.asarray(c0, dtype=float).copy()
-    A = _system_matrix(L, dt, glia)
-    N = A.shape[0]
-    if N <= SSOR_NODE_LIMIT:
-        M = ssor_preconditioner(A)
-    else:
-        M = jacobi_preconditioner(A)
-    trace = [c.copy()] if return_trace else None
-    for _ in range(steps):
-        if M is not None:
-            c, _n, _r = cg_solve(A, c, M, tol=tol)
-        else:
-            c, _st = solve_iterative(A, c, method="cg", preconditioner="jacobi", tol=tol)
-        if return_trace:
-            trace.append(c.copy())
-    return (c, trace) if return_trace else c
+    hist = []
+    if collect is not None:
+        hist.append((0.0, collect(c)))
+    n_small = n <= 40000
+    M = _ssor_pre(A) if n_small else None
+    D = A.diagonal()
+    Dsafe = np.where(np.abs(D) > 1e-14, D, 1.0)
+    Mj = spla.LinearOperator((n, n), matvec=lambda v: v / Dsafe, dtype=float)
+    for s in range(1, steps + 1):
+        c, st = _cg(A, c, M if n_small else Mj, tol=tol)
+        if collect is not None:
+            hist.append((s * dt, collect(c)))
+    return c, hist
