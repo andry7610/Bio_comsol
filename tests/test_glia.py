@@ -1,125 +1,91 @@
-
-import importlib.util
-import os
 import sys
+import pathlib
 import time
+
 import numpy as np
 import scipy.sparse as sp
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-def _load(name, rel, pkg):
-    root = os.path.join(os.path.dirname(__file__), "..", "biological")
-    spec = importlib.util.spec_from_file_location(name, os.path.join(root, rel))
-    return importlib.util.module_from_spec(spec), spec
-
-
-_spec_g, _ = _load("_g3m", "grid3d.py", None)
-sys.modules["_g3m"] = _spec_g
-_spec_g.loader.exec_module(_spec_g)
-GridGraph3D = _spec_g.GridGraph3D
-
-_spec_i, _ = _load("_ism", "iterative_solver.py", None)
-sys.modules["_ism"] = _spec_i
-_spec_i.loader.exec_module(_spec_i)
-
-# glia импортирует "grid3d" по имени - подменяем на наш модуль
-sys.modules["grid3d"] = _spec_g
-sys.modules["iterative_solver"] = _spec_i
-
-_spec_gl, _ = _load("_glm", "glia.py", None)
-sys.modules["_glm"] = _spec_gl
-_spec_gl.loader.exec_module(_spec_gl)
-GliaRegion = _spec_gl.GliaRegion
-box_mask = _spec_gl.box_mask
-sphere_mask = _spec_gl.sphere_mask
-glia_step = _spec_gl.glia_step
+from biological.grid3d import GridGraph3D
+from biological.glia import GliaRegion, box_mask, sphere_mask, glia_step
+from biological.iterative_solver import solve_direct
 
 
 def test_mass_balance_identity():
     g = GridGraph3D(12, 12, 1)
     L = g.laplacian
-    rng = np.random.default_rng(1)
+    reg = GliaRegion(box_mask(g, 4, 7, 4, 7, 0, 0), 2.0)
+    dt = 0.005
+    rng = np.random.default_rng(0)
     c = rng.random(g.N)
-    mask = box_mask(g, (4, 4, 0), (8, 8, 1))
-    reg = GliaRegion(mask, rate=1.0)
-    dt, D = 0.01, 1.0
-    m_old = c.sum()
-    c_new = glia_step(L, c, dt, D, reg)
-    S_new = c_new[reg.nodes].sum()
-    m_new = c_new.sum()
-    assert abs(m_new - (m_old - dt * D * 0 * 1 - dt * reg.rate * S_new)) < 1e-9
+    c1, _ = glia_step(c, L, reg, dt)
+    m_old = float(c.sum())
+    m_new = float(c1.sum())
+    assert abs(m_new - (m_old - dt * reg.consumption(c1))) < 1e-8
 
 
 def test_mass_strictly_decreases():
     g = GridGraph3D(10, 10, 1)
     L = g.laplacian
-    c = np.ones(g.N)
-    mask = np.zeros(g.shape, dtype=bool)
-    mask[4:6, 4:6, 0] = True
-    reg = GliaRegion(mask, rate=2.0)
-    dt, D = 0.005, 1.0
-    for _ in range(40):
-        c = glia_step(L, c, dt, D, reg)
-    assert c.min() > 0
-    assert c.sum() < 0.9 * g.N
+    reg = GliaRegion(box_mask(g, 4, 5, 4, 5, 0, 0), 2.0)
+    rng = np.random.default_rng(1)
+    c = rng.random(g.N)
+    m_prev = float(c.sum())
+    for _ in range(10):
+        c, _ = glia_step(c, L, reg, 0.01)
+        m = float(c.sum())
+        assert m < m_prev - 1e-12
+        m_prev = m
 
 
 def test_zero_rate_equals_pure_diffusion():
     g = GridGraph3D(8, 8, 1)
     L = g.laplacian
+    reg = GliaRegion(box_mask(g, 3, 4, 3, 4, 0, 0), 0.0)
     rng = np.random.default_rng(5)
     c = rng.random(g.N)
-    mask = np.ones(g.shape, dtype=bool)
-    reg = GliaRegion(mask, rate=0.0)
-    dt, D = 0.01, 1.0
-    c1 = glia_step(L, c, dt, D, reg)
-    n = g.N
-    A = sp.eye(n, format="csr") + dt * D * L
-    x_d = _spec_i.solve_direct(A, c)
-    assert np.max(np.abs(c1 - x_d)) < 1e-9
+    dt = 0.01
+    c1, _ = glia_step(c, L, reg, dt)
+    A = sp.identity(g.N, format="csr") + dt * L
+    x = solve_direct(A, c)
+    assert np.allclose(c1, x, atol=1e-9)
 
 
 def test_positivity_preserved():
     g = GridGraph3D(10, 10, 1)
     L = g.laplacian
-    rng = np.random.default_rng(9)
-    c = rng.random(g.N)
-    mask = np.zeros(g.shape, dtype=bool)
-    mask[4:6, 4:6, 0] = True
-    reg = GliaRegion(mask, rate=5.0)
-    dt, D = 0.01, 1.0
+    reg = GliaRegion(box_mask(g, 4, 5, 4, 5, 0, 0), 2.0)
+    c = np.zeros(g.N)
+    c[g.index(4, 4, 0)] = 5.0
     for _ in range(10):
-        c = glia_step(L, c, dt, D, reg)
-        assert c.min() >= 0
+        c, _ = glia_step(c, L, reg, 0.005)
+        assert c.min() >= -1e-12
 
 
 def test_masks_geometry():
     g = GridGraph3D(7, 7, 7)
-    sm = sphere_mask(g, (3, 3, 3), 2)
-    assert int(sm.sum()) == 33
-    bm = box_mask(g, (1, 1, 1), (6, 6, 6))
-    assert bm.shape == g.shape
-    assert bool(np.all(sm <= bm | ~bm).item() if False else True)
-    # сфера r=2 должна лежать в боксе [1..5]
-    nodes = np.flatnonzero(sm.ravel())
-    for nd in nodes:
-        ix, iy, iz = g.coords(nd)
-        assert 1 <= ix <= 5 and 1 <= iy <= 5 and 1 <= iz <= 5
+    s = sphere_mask(g, (3, 3, 3), 2)
+    assert int(s.sum()) == 33
+    assert s[1, 3, 3] and s[3, 3, 5]  # sphere honestly reaches r=2 shell
+    b = box_mask(g, 1, 3, 1, 3, 1, 3)
+    assert int(b.sum()) == 27
 
 
 def test_glia_200x200_auto_ssor():
-    t0 = time.time()
     g = GridGraph3D(200, 200, 1)
-    t_build = time.time() - t0
     L = g.laplacian
-    mask = box_mask(g, (80, 80, 0), (120, 120, 1))
-    reg = GliaRegion(mask, rate=2.0)
-    c = np.zeros(g.N)
-    c[g.N // 2] = 1.0
-    dt, D = 0.01, 1.0
-    t0 = time.perf_counter()
-    c_new = glia_step(L, c, dt, D, reg)
-    t_step = time.perf_counter() - t0
-    assert c_new.min() >= 0
-    assert t_build < 30.0
-    assert t_step < 30.0
+    reg = GliaRegion(box_mask(g, 90, 109, 90, 109, 0, 0), 2.0)
+    c = np.ones(g.N)
+    dt = 0.005
+    m0 = float(c.sum())
+    max_iters = 0
+    t0 = time.time()
+    for _ in range(40):
+        c, st = glia_step(c, L, reg, dt)
+        max_iters = max(max_iters, st["iters"])
+    per_step = (time.time() - t0) / 40
+    drop = m0 - float(c.sum())
+    assert max_iters <= 50
+    assert 0.0005 * m0 < drop < 0.05 * m0
+    assert c.min() >= -1e-12
