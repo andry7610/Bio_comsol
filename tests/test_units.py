@@ -1,57 +1,70 @@
-# test_units.py
-# Замки контракта единиц (Ступень 1). Все сравнения — через pytest.approx.
+# tests/test_units.py
+# Ступень 1 v1.0: замки контракта единиц (units.py).
+# Все внутренние расчёты солвера — безразмерные (F_RT=1.0);
+# units.py — адаптер на границе "биология (мВ, мкм) <-> SI (В, м)".
 
 import math
-
 import pytest
-
-from units import (
-    FARADAY, GAS_R, T_BODY, F_RT, RT_F,
-    MV_TO_V, V_TO_MV, UM_TO_M, M_TO_UM,
-    mv_to_v, v_to_mv,
-)
+import units
 
 
-def test_units_roundtrip_rest_potential():
-    test_mv = -65.0  # типичный потенциал покоя нейрона
-    assert v_to_mv(mv_to_v(test_mv)) == pytest.approx(test_mv, abs=1e-12)
+class TestConstants:
+    def test_codata_values(self):
+        assert units.FARADAY == pytest.approx(96485.33212, rel=1e-12)
+        assert units.GAS_R == pytest.approx(8.314462618, rel=1e-12)
+        assert units.T_BODY == pytest.approx(310.15, rel=1e-12)
+
+    def test_rt_f_derived_not_hardcoded(self):
+        # Рабочие связки обязаны вычисляться из констант, не быть зашитыми.
+        rtf = units.GAS_R * units.T_BODY / units.FARADAY
+        assert units.RT_F == rtf
+        assert units.F_RT == 1.0 / rtf
+        assert units.RT_F * units.F_RT == pytest.approx(1.0, abs=1e-15)
+
+    def test_rt_f_nernst_slope_37c(self):
+        # Наклон Нернста при 37 C: RT/F = 26.7267 мВ.
+        assert units.v_to_mv(units.RT_F) == pytest.approx(26.7267, abs=1e-4)
+
+    def test_nernst_potassium_sanity(self):
+        # E_K при [K+]_out/[K+]_in = 5/140 при 37 C ~ -89 мВ (учебник: ~-90).
+        e_k = units.v_to_mv(units.RT_F * math.log(5.0 / 140.0))
+        assert e_k == pytest.approx(-89.06, abs=0.1)
 
 
-def test_units_roundtrip_spike_amplitude():
-    test_mv = 100.0  # амплитуда спайка
-    assert mv_to_v(test_mv) == pytest.approx(0.1)
-    assert v_to_mv(0.1) == pytest.approx(test_mv)
+class TestMvV:
+    def test_scales(self):
+        assert units.MV_TO_V == 1e-3
+        assert units.V_TO_MV == 1e3
+
+    def test_zero_exact(self):
+        assert units.mv_to_v(0.0) == 0.0
+        assert units.v_to_mv(0.0) == 0.0
+
+    def test_roundtrip(self):
+        for v in (-80.0, -70.5, -1.8, 0.0, 12.3, 55.0):
+            assert units.v_to_mv(units.mv_to_v(v)) == pytest.approx(
+                v, rel=1e-12, abs=1e-12)
+
+    def test_roundtrip_not_bitexact_documented(self):
+        # Оговорка из шапки units.py: туда-обратно не бит-в-бит.
+        # Замок фиксирует ДОКУМЕНТИРОВАННОЕ поведение: расхождение есть,
+        # но крошечное (< 1e-13 мВ). Не менять на == !
+        rng = __import__("numpy").random.default_rng(42)
+        vals = rng.uniform(-100, 100, 50_000)
+        back = units.v_to_mv(units.mv_to_v(vals))
+        diff = abs(back - vals)
+        assert diff.max() < 1e-13
+        # и хотя бы одно значение реально не совпало бит-в-бит:
+        assert (diff > 0).sum() > 0
 
 
-def test_units_roundtrip_random_sample():
-    # Рантрип на произвольном значении — с допуском, не на точном равенстве
-    x = 13.5
-    assert v_to_mv(mv_to_v(x)) == pytest.approx(x, abs=1e-12)
+class TestUm:
+    def test_scales(self):
+        assert units.UM_TO_M == 1e-6
+        assert units.M_TO_UM == 1e6
 
-
-def test_units_scale_constants():
-    assert MV_TO_V == pytest.approx(1e-3)
-    assert V_TO_MV == pytest.approx(1e3)
-    assert UM_TO_M == pytest.approx(1e-6)
-    assert M_TO_UM == pytest.approx(1e6)
-
-
-def test_units_thermal_voltage_body():
-    # RT/F при 37 C (310.15 K) = 26.7267 мВ — золотое число нейронной главы
-    expected_rt_f = GAS_R * T_BODY / FARADAY
-    assert expected_rt_f == pytest.approx(0.0267267, abs=1e-7)
-    assert RT_F == pytest.approx(expected_rt_f)
-    assert F_RT == pytest.approx(1.0 / expected_rt_f)
-    # Проверка величин: F/RT при 37 C = 37.4158 1/В
-    assert F_RT == pytest.approx(37.4158, abs=1e-3)
-
-
-def test_units_thermal_voltage_room():
-    # Сверка с известным значением: RT/F при 25 C (298.15 K) = 25.69 мВ.
-    # Точное значение 0.0256926 В; эталон даём с допуском на округление.
-    rt_f_25 = GAS_R * 298.15 / FARADAY
-    assert rt_f_25 == pytest.approx(0.0256926, abs=1e-6)
-
-
-def test_units_temperature_body_value():
-    assert T_BODY == pytest.approx(310.15)
+    def test_roundtrip_and_scale(self):
+        # 10 мкм -> 1e-5 м -> обратно 10 мкм.
+        meters = 10.0 * units.UM_TO_M
+        assert meters == pytest.approx(1e-5)
+        assert meters * units.M_TO_UM == pytest.approx(10.0)
