@@ -1,65 +1,75 @@
-
-"""Глия как объёмный сток: неявный шаг (I + dt*D*L + dt*k*P) c_new = c_old.
-
-Сток линеен по c -> Ньютон вырождается в один линейный шаг.
-Маски - 3D (shape сетки), вектор c - плоский в порядке графа (C-order).
-"""
-
+"""Глия: объёмный сток ионов. Маски 3D, вектор c — плоский (C-order графа)."""
 import numpy as np
 import scipy.sparse as sp
+try:
+    from .iterative_solver import (solve_iterative, cg_solve, ssor_preconditioner,
+                                   jacobi_preconditioner, SSOR_NODE_LIMIT)
+except ImportError:
+    from iterative_solver import (solve_iterative, cg_solve, ssor_preconditioner,
+                                  jacobi_preconditioner, SSOR_NODE_LIMIT)
 
-from grid3d import GridGraph3D
+
+def box_mask(shape, box):
+    """box = ((x0,x1),(y0,y1),(z0,z1)) — включительно."""
+    m = np.zeros(tuple(int(s) for s in shape), dtype=bool)
+    (x0, x1), (y0, y1), (z0, z1) = box
+    m[x0:x1 + 1, y0:y1 + 1, z0:z1 + 1] = True
+    return m
+
+
+def sphere_mask(shape, center, radius):
+    """Евклидова сфера: d <= r (включительно)."""
+    nx, ny, nz = (int(s) for s in shape)
+    ii, jj, kk = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing="ij")
+    d2 = (ii - center[0]) ** 2 + (jj - center[1]) ** 2 + (kk - center[2]) ** 2
+    return d2 <= radius ** 2 + 1e-9
 
 
 class GliaRegion:
-    def __init__(self, mask3d, rate):
-        self.mask = np.asarray(mask3d, dtype=bool)
+    """Маска зоны глии + скорость потребления k. diagonal — индикатор маски;
+    rate входит в систему один раз (в glia_step), двойного счёта нет."""
+
+    def __init__(self, mask, rate=1.0):
+        self.mask = np.asarray(mask, dtype=bool)
         self.rate = float(rate)
-        self.nodes = np.flatnonzero(self.mask.ravel())
+
+    @property
+    def diagonal(self):
+        return self.mask.astype(float).ravel()
+
+    @property
+    def nnodes(self):
+        return int(self.mask.sum())
 
 
-def box_mask(g, lo, hi):
-    """Полузамкнутый бокс [lo, hi) по каждой оси, в индексах сетки."""
-    nx, ny, nz = g.shape
-    ix = np.arange(nx)
-    iy = np.arange(ny)
-    iz = np.arange(nz)
-    mx = (ix >= lo[0]) & (ix < hi[0])
-    my = (iy >= lo[1]) & (iy < hi[1])
-    mz = (iz >= lo[2]) & (iz < hi[2])
-    return mx[:, None, None] & my[None, :, None] & mz[None, None, :]
+def _system_matrix(L, dt, glia):
+    N = L.shape[0]
+    return (sp.identity(N, format="csr") + dt * L + dt * glia.rate * sp.diags(glia.diagonal)).tocsr()
 
 
-def sphere_mask(g, center, radius):
-    nx, ny, nz = g.shape
-    ix = np.arange(nx)[:, None, None]
-    iy = np.arange(ny)[None, :, None]
-    iz = np.arange(nz)[None, None, :]
-    d2 = (ix - center[0]) ** 2 + (iy - center[1]) ** 2 + (iz - center[2]) ** 2
-    return d2 <= radius ** 2
-
-
-def glia_step(L, c, dt, D, region):
-    """Один неявный шаг с глиальным стоком. c - плоский вектор."""
-    L = sp.csr_matrix(L)
-    n = L.shape[0]
+def glia_step(L, c, dt, glia, tol=1e-12, method="auto", preconditioner="auto"):
+    """Один неявный шаг: (I + dt*L + dt*k*P) c_new = c_old."""
     c = np.asarray(c, dtype=float)
-    k = region.rate
-    Sdiag = np.zeros(n)
-    Sdiag[region.nodes] = k
-    A = sp.eye(n, format="csr") + dt * D * L + sp.diags(dt * Sdiag)
-    rhs = c.copy()
-    import scipy.sparse.linalg as spla
-    if n <= SSOR_LIMIT_:
-        x, _ = _solve(A, rhs, "ssor")
-    else:
-        x, _ = _solve(A, rhs, "jacobi")
+    A = _system_matrix(L, dt, glia)
+    x, _st = solve_iterative(A, c, method=method, preconditioner=preconditioner, tol=tol)
     return x
 
 
-SSOR_LIMIT_ = 40000
-
-
-def _solve(A, b, pre):
-    from iterative_solver import solve_iterative
-    return solve_iterative(A, b, method="cg", preconditioner=pre, tol=1e-10)
+def glia_series(L, c0, dt, glia, steps, tol=1e-10, return_trace=False):
+    """Серия шагов с кэшем матрицы A и SSOR-предобуславливателя (факторизация один раз)."""
+    c = np.asarray(c0, dtype=float).copy()
+    A = _system_matrix(L, dt, glia)
+    N = A.shape[0]
+    if N <= SSOR_NODE_LIMIT:
+        M = ssor_preconditioner(A)
+    else:
+        M = jacobi_preconditioner(A)
+    trace = [c.copy()] if return_trace else None
+    for _ in range(steps):
+        if M is not None:
+            c, _n, _r = cg_solve(A, c, M, tol=tol)
+        else:
+            c, _st = solve_iterative(A, c, method="cg", preconditioner="jacobi", tol=tol)
+        if return_trace:
+            trace.append(c.copy())
+    return (c, trace) if return_trace else c
